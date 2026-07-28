@@ -38,8 +38,15 @@ def build_parser():
   parser.add_argument("--scene_dir", default=str(code_dir / "demo_data" / "cough"))
   parser.add_argument(
       "--mesh_file",
-      default=str(code_dir / "demo_data" / "cough" / "mesh" / "paper_cup.obj"),
+      default=None,
+      help="Explicit OBJ override; otherwise cad_root/cad_name/edited/cad_name.obj.",
   )
+  parser.add_argument(
+      "--cad_root",
+      default="/media/uon/data/3d_model/peel3_scan_data_2025",
+      help="Root of the external CAD database as mounted inside the container.",
+  )
+  parser.add_argument("--cad_name", default="paper_cup")
   parser.add_argument("--target_class", default="obj_120")
   parser.add_argument("--camera_name", default="top_view_camera")
   parser.add_argument("--mask_color", nargs=3, type=int, default=(255, 25, 25))
@@ -95,6 +102,17 @@ def main():
   set_logging_format()
   set_seed(0)
   path_mappings = parse_path_mappings(args.path_map)
+  cad_object_dir = Path(args.cad_root).expanduser() / args.cad_name
+  if args.mesh_file:
+    mesh_file = Path(args.mesh_file).expanduser()
+    texture_roots = list(args.texture_root)
+  else:
+    # The Peel3 database stores edited geometry/material below edited/, while
+    # the corresponding *_edited.bmp texture remains in the object directory.
+    mesh_file = cad_object_dir / "edited" / f"{args.cad_name}.obj"
+    texture_roots = [str(cad_object_dir), *args.texture_root]
+  logging.info("CAD mesh: %s", mesh_file)
+
   debug_root = Path(args.debug_dir).expanduser().resolve()
   debug_dir = debug_root / args.camera_name
   (debug_dir / "track_vis").mkdir(parents=True, exist_ok=True)
@@ -113,10 +131,10 @@ def main():
   )
 
   with load_mesh_readonly(
-      mesh_file=args.mesh_file,
+      mesh_file=mesh_file,
       mesh_scale=args.mesh_scale,
       path_mappings=path_mappings,
-      texture_roots=args.texture_root,
+      texture_roots=texture_roots,
       max_texture_size=args.max_texture_size,
   ) as mesh:
     to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
