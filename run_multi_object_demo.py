@@ -1,14 +1,13 @@
 """Estimate poses for every CAD-backed object visible in one synthetic frame.
 
 Object selection follows the same scene_meta validation used by the single
-object adapter. Class IDs are mapped strictly to objects_metadata.csv Old_name;
-there is intentionally no Object_name or directory-name fallback.
+object adapter. Class IDs are resolved through objects_metadata.csv using
+Old_name first and Object_name when the Old_name asset is unavailable.
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import logging
 from pathlib import Path
@@ -19,9 +18,17 @@ import nvdiffrast.torch as dr
 import numpy as np
 import torch
 import trimesh
-from scipy.optimize import linear_sum_assignment
 
-from custom_datareader import CustomSceneReader, load_mesh_readonly
+from custom_datareader import (
+    CustomSceneReader,
+    load_mesh_readonly,
+    load_object_catalog,
+    resolve_2025_cad,
+)
+from custom_mask_utils import (
+    get_camera,
+    match_class_ids_to_mask_colors,
+)
 from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
 from Utils import (
     draw_posed_3d_box,
@@ -91,144 +98,6 @@ def get_frame_id(scene_dir, camera_name, requested):
   return requested
 
 
-def load_old_name_catalog(csv_path):
-  catalog = {}
-  with Path(csv_path).open("r", encoding="utf-8-sig", newline="") as stream:
-    for row in csv.DictReader(stream):
-      class_id = row.get("Class_name", "").strip()
-      old_name = row.get("Old_name", "").strip()
-      if class_id and old_name:
-        catalog[class_id] = old_name
-  return catalog
-
-
-def get_camera(frame_metadata, camera_name):
-  matches = [
-      camera for camera in frame_metadata.get("cameras", [])
-      if camera.get("name") == camera_name
-  ]
-  if len(matches) != 1:
-    available = [
-        camera.get("name") for camera in frame_metadata.get("cameras", [])
-    ]
-    raise ValueError(
-        f"Expected one camera named {camera_name!r}, found {len(matches)}; "
-        f"available cameras: {available}"
-    )
-  return matches[0]
-
-
-def project_world_point(camera, world_point):
-  """Project an Isaac/Usd camera-space point onto source-image pixels."""
-  cam_in_world = np.asarray(camera["cam_poses"], dtype=np.float64).reshape(4, 4)
-  world_point = np.asarray(world_point, dtype=np.float64).reshape(3)
-  point_glcam = cam_in_world[:3, :3].T @ (
-      world_point - cam_in_world[:3, 3]
-  )
-  depth = -point_glcam[2]
-  if depth <= 0:
-    return None
-
-  K = np.asarray(camera["intrinsic_isaac"], dtype=np.float64).reshape(3, 3)
-  # Isaac camera metadata uses an OpenGL camera convention: forward is -Z and
-  # image Y points opposite camera Y.
-  u = K[0, 2] + K[0, 0] * point_glcam[0] / depth
-  v = K[1, 2] - K[1, 1] * point_glcam[1] / depth
-  return np.asarray([u, v], dtype=np.float64)
-
-
-def nonzero_segmentation_colors(segmentation):
-  rgb = np.ascontiguousarray(segmentation[..., :3].astype(np.uint8, copy=False))
-  colors = np.unique(rgb.reshape(-1, 3), axis=0)
-  return [tuple(int(value) for value in color) for color in colors if np.any(color)]
-
-
-def min_distance_to_color(segmentation_rgb, color, uv):
-  ys, xs = np.where(np.all(segmentation_rgb == np.asarray(color), axis=-1))
-  if len(xs) == 0:
-    return np.inf
-  distances = (xs.astype(np.float64) - uv[0]) ** 2
-  distances += (ys.astype(np.float64) - uv[1]) ** 2
-  return float(np.sqrt(distances.min()))
-
-
-def match_class_ids_to_mask_colors(
-    scene_class_ids,
-    frame_metadata,
-    camera,
-    segmentation,
-    max_distance,
-):
-  """Match GT-projected object centers to colored instance-mask regions."""
-  object_positions = {
-      item["class"]: item["translate"]
-      for item in frame_metadata.get("objects", [])
-      if "class" in item and "translate" in item
-  }
-  projected = []
-  projected_classes = []
-  for class_id in scene_class_ids:
-    if class_id not in object_positions:
-      logging.warning("Skipping %s: no object translation in frame metadata", class_id)
-      continue
-    uv = project_world_point(camera, object_positions[class_id])
-    if uv is None:
-      logging.warning("Skipping %s: object center is behind the camera", class_id)
-      continue
-    projected_classes.append(class_id)
-    projected.append(uv)
-
-  colors = nonzero_segmentation_colors(segmentation)
-  if not projected_classes or not colors:
-    return {}
-
-  segmentation_rgb = segmentation[..., :3].astype(np.uint8, copy=False)
-  costs = np.empty((len(projected_classes), len(colors)), dtype=np.float64)
-  for row, uv in enumerate(projected):
-    for col, color in enumerate(colors):
-      costs[row, col] = min_distance_to_color(segmentation_rgb, color, uv)
-
-  rows, cols = linear_sum_assignment(costs)
-  matches = {}
-  for row, col in zip(rows, cols):
-    distance = costs[row, col]
-    class_id = projected_classes[row]
-    if distance > max_distance:
-      logging.warning(
-          "Skipping %s: nearest unique mask assignment is %.1f px away",
-          class_id,
-          distance,
-      )
-      continue
-    matches[class_id] = colors[col]
-    logging.info(
-        "Mask match: %s -> RGB%s (projected distance %.1f px)",
-        class_id,
-        colors[col],
-        distance,
-    )
-  return matches
-
-
-def resolve_old_name_cad(cad_root, old_name):
-  """Resolve only the canonical Old_name layout; never fall back."""
-  object_dir = Path(cad_root).expanduser() / old_name
-  mesh_file = object_dir / "edited" / f"{old_name}.obj"
-  material_file = object_dir / "edited" / f"{old_name}.mtl"
-  texture_file = object_dir / f"{old_name}_edited.bmp"
-  missing = [
-      path for path in (mesh_file, material_file, texture_file) if not path.is_file()
-  ]
-  if missing:
-    return None, missing
-  return {
-      "object_dir": object_dir,
-      "mesh_file": mesh_file,
-      "material_file": material_file,
-      "texture_file": texture_file,
-  }, []
-
-
 def draw_pose(original, K, pose, to_origin, bbox, extents, class_id, color):
   center_pose = pose @ np.linalg.inv(to_origin)
   linewidth = 7
@@ -288,7 +157,7 @@ def main():
       if args.objects_metadata
       else scene_dir / "objects_metadata.csv"
   )
-  old_names = load_old_name_catalog(csv_path)
+  object_catalog = load_object_catalog(csv_path)
   camera = get_camera(frame_metadata, args.camera_name)
   segmentation_path = (
       scene_dir / "masks" / args.camera_name / f"{frame_id}.png"
@@ -306,31 +175,38 @@ def main():
 
   jobs = []
   for class_id in scene_class_ids:
-    old_name = old_names.get(class_id)
-    if not old_name:
-      logging.warning("Skipping %s: Old_name is missing in %s", class_id, csv_path)
+    names = object_catalog.get(class_id)
+    if names is None:
+      logging.warning("Skipping %s: metadata row is missing in %s", class_id, csv_path)
       continue
-    cad, missing = resolve_old_name_cad(args.cad_root, old_name)
+    cad, attempts = resolve_2025_cad(args.cad_root, names)
     if cad is None:
+      attempted = ", ".join(
+          f"{item['source_field']}={item['name']!r}"
+          for item in attempts
+      ) or "no non-empty Old_name/Object_name"
       logging.warning(
-          "Skipping %s (%s): required Old_name CAD files are missing: %s",
+          "Skipping %s: no complete 2025 CAD asset; tried %s",
           class_id,
-          old_name,
-          ", ".join(str(path) for path in missing),
+          attempted,
       )
       continue
     if class_id not in mask_colors:
-      logging.warning("Skipping %s (%s): mask color was not resolved", class_id, old_name)
+      logging.warning(
+          "Skipping %s (%s): mask color was not resolved",
+          class_id,
+          cad["name"],
+      )
       continue
-    jobs.append((class_id, old_name, cad, mask_colors[class_id]))
+    jobs.append((class_id, cad, mask_colors[class_id]))
 
   if not jobs:
-    raise RuntimeError("No scene objects have both Old_name CAD files and a mask")
+    raise RuntimeError("No scene objects have both a resolved 2025 CAD asset and a mask")
   logging.info(
       "Processing %d/%d scene objects: %s",
       len(jobs),
       len(scene_class_ids),
-      [class_id for class_id, _, _, _ in jobs],
+      [class_id for class_id, _, _ in jobs],
   )
 
   debug_camera_dir = (
@@ -353,11 +229,16 @@ def main():
       (128, 128, 255),
   ]
 
-  for object_index, (class_id, old_name, cad, mask_color) in enumerate(jobs):
+  for object_index, (class_id, cad, mask_color) in enumerate(jobs):
     object_debug_dir = debug_camera_dir / class_id
     (object_debug_dir / "ob_in_cam").mkdir(parents=True, exist_ok=True)
     (object_debug_dir / "track_vis").mkdir(parents=True, exist_ok=True)
-    logging.info("Registering %s using Old_name CAD %s", class_id, old_name)
+    logging.info(
+        "Registering %s using %s CAD %s",
+        class_id,
+        cad["source_field"],
+        cad["name"],
+    )
 
     reader = CustomSceneReader(
         scene_dir=scene_dir,

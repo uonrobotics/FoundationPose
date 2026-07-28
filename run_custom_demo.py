@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 from pathlib import Path
@@ -16,8 +17,14 @@ import trimesh
 
 from custom_datareader import (
     CustomSceneReader,
+    load_object_catalog,
     load_mesh_readonly,
     parse_path_mappings,
+    resolve_2025_cad,
+)
+from custom_mask_utils import (
+    get_camera,
+    match_class_ids_to_mask_colors,
 )
 from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
 from Utils import (
@@ -39,17 +46,48 @@ def build_parser():
   parser.add_argument(
       "--mesh_file",
       default=None,
-      help="Explicit OBJ override; otherwise cad_root/cad_name/edited/cad_name.obj.",
+      help="Explicit OBJ override; takes precedence over all CAD name lookup.",
   )
   parser.add_argument(
       "--cad_root",
       default="/media/uon/data/3d_model/peel3_scan_data_2025",
       help="Root of the external CAD database as mounted inside the container.",
   )
-  parser.add_argument("--cad_name", default="paper_cup")
-  parser.add_argument("--target_class", default="obj_120")
+  parser.add_argument(
+      "--cad_name",
+      default="paper_cup",
+      help=(
+          "Object name to find in objects_metadata.csv (Old_name first, then "
+          "Object_name). Defaults to paper_cup."
+      ),
+  )
+  parser.add_argument(
+      "--objects_metadata",
+      default=None,
+      help="Defaults to <scene_dir>/objects_metadata.csv.",
+  )
+  parser.add_argument(
+      "--target_class",
+      default=None,
+      help=(
+          "Advanced class-ID override, primarily for --mesh_file. When using "
+          "a database CAD, it must match the class resolved from --cad_name."
+      ),
+  )
   parser.add_argument("--camera_name", default="top_view_camera")
-  parser.add_argument("--mask_color", nargs=3, type=int, default=(255, 25, 25))
+  parser.add_argument(
+      "--mask_color",
+      nargs=3,
+      type=int,
+      default=None,
+      help="Optional RGB override; by default the instance color is detected automatically.",
+  )
+  parser.add_argument(
+      "--max_mask_match_distance",
+      type=float,
+      default=250.0,
+      help="Maximum source-image pixel distance for automatic mask-color matching.",
+  )
   parser.add_argument(
       "--max_image_size",
       type=int,
@@ -96,22 +134,119 @@ def main():
     raise ValueError("--max_texture_size cannot be negative")
   if args.max_image_size < 0:
     raise ValueError("--max_image_size cannot be negative")
-  if any(value < 0 or value > 255 for value in args.mask_color):
+  if args.mask_color and any(value < 0 or value > 255 for value in args.mask_color):
     raise ValueError("--mask_color values must be between 0 and 255")
+  if args.max_mask_match_distance < 0:
+    raise ValueError("--max_mask_match_distance cannot be negative")
 
   set_logging_format()
   set_seed(0)
   path_mappings = parse_path_mappings(args.path_map)
-  cad_object_dir = Path(args.cad_root).expanduser() / args.cad_name
+  scene_dir = Path(args.scene_dir).expanduser().resolve()
+  csv_path = (
+      Path(args.objects_metadata).expanduser()
+      if args.objects_metadata
+      else scene_dir / "objects_metadata.csv"
+  )
+  object_catalog = load_object_catalog(csv_path)
+
+  # A single-object run is selected by its human-readable CAD name. Resolve
+  # Old_name before Object_name, then use the matched Class_name internally
+  # for scene validation and mask extraction.
+  matches = [
+      class_id for class_id, names in object_catalog.items()
+      if names["old_name"] == args.cad_name
+  ]
+  matched_field = "Old_name"
+  if not matches:
+    matches = [
+        class_id for class_id, names in object_catalog.items()
+        if names["object_name"] == args.cad_name
+    ]
+    matched_field = "Object_name"
+  if len(matches) > 1:
+    raise ValueError(
+        f"CAD name {args.cad_name!r} is ambiguous in {csv_path}: {matches}"
+    )
+  resolved_class = matches[0] if matches else None
+
+  if args.target_class:
+    if resolved_class and args.target_class != resolved_class and not args.mesh_file:
+      raise ValueError(
+          f"--cad_name {args.cad_name!r} resolves to {resolved_class}, but "
+          f"--target_class specifies {args.target_class}"
+      )
+    target_class = args.target_class
+  elif resolved_class:
+    target_class = resolved_class
+  else:
+    raise ValueError(
+        f"CAD name {args.cad_name!r} was not found in Old_name or Object_name "
+        f"of {csv_path}; specify --target_class only when using --mesh_file"
+    )
+
   if args.mesh_file:
     mesh_file = Path(args.mesh_file).expanduser()
     texture_roots = list(args.texture_root)
+    logging.info("Using explicit mesh override: %s", mesh_file)
   else:
-    # The Peel3 database stores edited geometry/material below edited/, while
-    # the corresponding *_edited.bmp texture remains in the object directory.
-    mesh_file = cad_object_dir / "edited" / f"{args.cad_name}.obj"
-    texture_roots = [str(cad_object_dir), *args.texture_root]
+    names = object_catalog[target_class]
+    cad, attempts = resolve_2025_cad(args.cad_root, names)
+    if cad is None:
+      attempted = ", ".join(
+          f"{item['source_field']}={item['name']!r}"
+          for item in attempts
+      ) or "no non-empty Old_name/Object_name"
+      raise FileNotFoundError(
+          f"No complete 2025 CAD asset for {target_class}; tried {attempted}"
+      )
+    mesh_file = cad["mesh_file"]
+    texture_roots = [str(cad["object_dir"]), *args.texture_root]
+    logging.info(
+        "Selected %s via %s=%s; resolved CAD asset using %s=%s",
+        target_class,
+        matched_field,
+        args.cad_name,
+        cad["source_field"],
+        cad["name"],
+    )
   logging.info("CAD mesh: %s", mesh_file)
+
+  if args.mask_color:
+    mask_color = tuple(args.mask_color)
+    logging.info("Using explicit mask color override: RGB%s", mask_color)
+  else:
+    rgb_dir = scene_dir / "rgb" / args.camera_name
+    rgb_files = sorted(rgb_dir.glob("*.png"))
+    if not rgb_files:
+      raise FileNotFoundError(f"No RGB PNG files found in {rgb_dir}")
+    frame_id = rgb_files[0].stem
+    with (scene_dir / f"{frame_id}.json").open("r", encoding="utf-8") as stream:
+      frame_metadata = json.load(stream)
+    scene_meta_path = scene_dir / "scene_meta" / f"{frame_id}.json"
+    with scene_meta_path.open("r", encoding="utf-8") as stream:
+      scene_metadata = json.load(stream)
+    scene_class_ids = list(scene_metadata.get("objects", {}).keys())
+    segmentation_path = (
+        scene_dir / "masks" / args.camera_name / f"{frame_id}.png"
+    )
+    segmentation = imageio.imread(segmentation_path)
+    if segmentation.ndim != 3 or segmentation.shape[2] < 3:
+      raise ValueError(f"Expected colored segmentation at {segmentation_path}")
+    mask_colors = match_class_ids_to_mask_colors(
+        scene_class_ids,
+        frame_metadata,
+        get_camera(frame_metadata, args.camera_name),
+        segmentation,
+        args.max_mask_match_distance,
+    )
+    if target_class not in mask_colors:
+      raise ValueError(
+          f"Could not automatically match {target_class} to a color in "
+          f"{segmentation_path}; use --mask_color R G B to override"
+      )
+    mask_color = mask_colors[target_class]
+    logging.info("Automatically selected mask color RGB%s", mask_color)
 
   debug_root = Path(args.debug_dir).expanduser().resolve()
   debug_dir = debug_root / args.camera_name
@@ -121,13 +256,13 @@ def main():
   reader = CustomSceneReader(
       scene_dir=args.scene_dir,
       camera_name=args.camera_name,
-      target_class=args.target_class,
-      mask_color=args.mask_color,
+      target_class=target_class,
+      mask_color=mask_color,
       max_image_size=args.max_image_size,
   )
   logging.info(
       "Loaded %d frame(s), resolution=%dx%d, camera=%s, target=%s",
-      len(reader), reader.W, reader.H, args.camera_name, args.target_class,
+      len(reader), reader.W, reader.H, args.camera_name, target_class,
   )
 
   with load_mesh_readonly(

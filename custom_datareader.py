@@ -7,6 +7,7 @@ in memory or in a temporary directory.
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import shlex
@@ -19,6 +20,59 @@ import imageio
 import numpy as np
 import trimesh
 from PIL import Image
+
+
+def load_object_catalog(csv_path):
+  """Load CAD lookup names keyed by the synthetic scene class ID."""
+  csv_path = Path(csv_path).expanduser()
+  catalog = {}
+  with csv_path.open("r", encoding="utf-8-sig", newline="") as stream:
+    for row in csv.DictReader(stream):
+      class_id = row.get("Class_name", "").strip()
+      if not class_id:
+        continue
+      catalog[class_id] = {
+          "old_name": row.get("Old_name", "").strip(),
+          "object_name": row.get("Object_name", "").strip(),
+      }
+  return catalog
+
+
+def resolve_2025_cad(cad_root, names):
+  """Resolve a 2025 CAD asset by Old_name first, then Object_name."""
+  cad_root = Path(cad_root).expanduser()
+  attempts = []
+  seen = set()
+  for source_field, name in (
+      ("Old_name", names.get("old_name", "")),
+      ("Object_name", names.get("object_name", "")),
+  ):
+    if not name or name in seen:
+      continue
+    seen.add(name)
+    object_dir = cad_root / name
+    mesh_file = object_dir / "edited" / f"{name}.obj"
+    material_file = object_dir / "edited" / f"{name}.mtl"
+    texture_file = object_dir / f"{name}_edited.bmp"
+    missing = [
+        path for path in (mesh_file, material_file, texture_file)
+        if not path.is_file()
+    ]
+    attempts.append({
+        "source_field": source_field,
+        "name": name,
+        "missing": missing,
+    })
+    if not missing:
+      return {
+          "source_field": source_field,
+          "name": name,
+          "object_dir": object_dir,
+          "mesh_file": mesh_file,
+          "material_file": material_file,
+          "texture_file": texture_file,
+      }, attempts
+  return None, attempts
 
 
 class CustomSceneReader:
