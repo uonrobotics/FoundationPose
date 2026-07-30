@@ -22,6 +22,10 @@ import trimesh
 from PIL import Image
 
 
+class NonstandardMapKdError(ValueError):
+  """Raised when strict CAD loading rejects a nonstandard texture name."""
+
+
 def load_object_catalog(csv_path):
   """Load CAD lookup names keyed by the synthetic scene class ID."""
   csv_path = Path(csv_path).expanduser()
@@ -34,6 +38,7 @@ def load_object_catalog(csv_path):
       catalog[class_id] = {
           "old_name": row.get("Old_name", "").strip(),
           "object_name": row.get("Object_name", "").strip(),
+          "year": row.get("Year", "").strip(),
       }
   return catalog
 
@@ -75,6 +80,51 @@ def resolve_2025_cad(cad_root, names):
   return None, attempts
 
 
+def append_cad_asset_issues(log_path, issues, frame_id, class_id, cad_name):
+  """Write compact, de-duplicated CAD texture issues for the current run."""
+  if not issues:
+    return
+  log_path = Path(log_path)
+  if log_path.is_file():
+    with log_path.open("r", encoding="utf-8") as stream:
+      records = json.load(stream)
+  else:
+    records = []
+  for issue in issues:
+    if issue["issue"] == "nonstandard_map_kd":
+      message = (
+          "MTL texture name differs from the standard 2025 CAD pattern. "
+          "This object was skipped."
+      )
+    elif issue["issue"] == "unsupported_cad_year":
+      message = (
+          "The object belongs to the unsupported 2024 CAD database. "
+          "This object was skipped."
+      )
+    else:
+      message = (
+          "The texture referenced by map_Kd does not exist. "
+          "This object was skipped."
+      )
+    record = {
+        "frame_id": frame_id,
+        "class_id": class_id,
+        "cad_name": cad_name,
+        "issue": issue["issue"],
+    }
+    if issue["issue"] != "unsupported_cad_year":
+      record.update({
+          "expected_texture": issue["expected_texture"],
+          "resolved_texture": issue["resolved_texture"],
+      })
+    record["message"] = message
+    if record not in records:
+      records.append(record)
+  with log_path.open("w", encoding="utf-8") as stream:
+    json.dump(records, stream, ensure_ascii=False, indent=2)
+    stream.write("\n")
+
+
 class CustomSceneReader:
   """Read RGB PNG, float32 NPY depth, colored masks, and frame JSON metadata."""
 
@@ -85,6 +135,7 @@ class CustomSceneReader:
       target_class="obj_120",
       mask_color=(255, 25, 25),
       max_image_size=640,
+      validation_frame_id=None,
   ):
     self.scene_dir = Path(scene_dir).expanduser().resolve()
     self.camera_name = camera_name
@@ -127,7 +178,20 @@ class CustomSceneReader:
     self.H = int(round(self.source_H * self.scale))
     self.W = int(round(self.source_W * self.scale))
 
-    scene_meta_path = self.scene_dir / "scene_meta" / f"{self.id_strs[0]}.json"
+    if validation_frame_id is None:
+      validation_i = 0
+    else:
+      try:
+        validation_i = self.id_strs.index(str(validation_frame_id))
+      except ValueError as error:
+        raise ValueError(
+            f"Validation frame {validation_frame_id!r} is absent from "
+            f"{self.data_dirs['rgb']}"
+        ) from error
+
+    scene_meta_path = (
+        self.scene_dir / "scene_meta" / f"{self.id_strs[validation_i]}.json"
+    )
     if scene_meta_path.exists():
       with scene_meta_path.open("r", encoding="utf-8") as stream:
         scene_meta = json.load(stream)
@@ -139,8 +203,8 @@ class CustomSceneReader:
         )
 
     # Preserve run_demo.py compatibility for callers which access reader.K.
-    self.K = self.get_K(0)
-    self._validate_frame(0)
+    self.K = self.get_K(validation_i)
+    self._validate_frame(validation_i)
 
   def __len__(self):
     return len(self.color_files)
@@ -149,7 +213,7 @@ class CustomSceneReader:
     return self.data_dirs[folder] / f"{self.id_strs[i]}{suffix}"
 
   def _frame_metadata(self, i):
-    path = self.scene_dir / f"{self.id_strs[i]}.json"
+    path = self.scene_dir / "conf" / f"{self.id_strs[i]}.json"
     if not path.exists():
       raise FileNotFoundError(f"Frame metadata not found: {path}")
     with path.open("r", encoding="utf-8") as stream:
@@ -251,7 +315,15 @@ def parse_path_mappings(values):
   return mappings
 
 
-def _resolve_texture_path(raw_path, mesh_dir, path_mappings, texture_roots):
+def _resolve_texture_path(
+    raw_path,
+    mesh_dir,
+    path_mappings,
+    texture_roots,
+    expected_texture_file=None,
+    texture_diagnostics=None,
+    reject_nonstandard_texture=False,
+):
   expanded = os.path.expandvars(os.path.expanduser(raw_path))
   candidates = [Path(expanded)]
 
@@ -272,12 +344,49 @@ def _resolve_texture_path(raw_path, mesh_dir, path_mappings, texture_roots):
 
   for candidate in candidates:
     if candidate.is_file():
-      return candidate.resolve()
+      resolved = candidate.resolve()
+      if (
+          expected_texture_file is not None
+          and Path(raw_path).name != Path(expected_texture_file).name
+      ):
+        diagnostic = {
+            "issue": "nonstandard_map_kd",
+            "map_kd": raw_path,
+            "expected_texture": Path(expected_texture_file).name,
+            "resolved_texture": str(resolved),
+        }
+        if texture_diagnostics is not None:
+          texture_diagnostics.append(diagnostic)
+        if reject_nonstandard_texture:
+          raise NonstandardMapKdError(
+              f"Nonstandard map_Kd texture name: {Path(raw_path).name!r}; "
+              f"expected {Path(expected_texture_file).name!r}"
+          )
+      return resolved
+  if texture_diagnostics is not None:
+    texture_diagnostics.append({
+        "issue": "missing_map_kd_texture",
+        "map_kd": raw_path,
+        "expected_texture": (
+            Path(expected_texture_file).name
+            if expected_texture_file is not None
+            else None
+        ),
+        "resolved_texture": None,
+    })
   rendered = "\n  ".join(str(candidate) for candidate in candidates)
   raise FileNotFoundError(f"Could not resolve texture {raw_path!r}; tried:\n  {rendered}")
 
 
-def _runtime_mtl(original_mtl, runtime_dir, path_mappings, texture_roots):
+def _runtime_mtl(
+    original_mtl,
+    runtime_dir,
+    path_mappings,
+    texture_roots,
+    expected_texture_file=None,
+    texture_diagnostics=None,
+    reject_nonstandard_texture=False,
+):
   output_lines = []
   with original_mtl.open("r", encoding="utf-8") as stream:
     for line in stream:
@@ -290,7 +399,13 @@ def _runtime_mtl(original_mtl, runtime_dir, path_mappings, texture_roots):
         # The current dataset has no map options. Taking the last token also
         # handles the common option-bearing form, e.g. "map_Kd -s 1 1 1 x.png".
         source = _resolve_texture_path(
-            tokens[-1], original_mtl.parent, path_mappings, texture_roots
+            tokens[-1],
+            original_mtl.parent,
+            path_mappings,
+            texture_roots,
+            expected_texture_file=expected_texture_file,
+            texture_diagnostics=texture_diagnostics,
+            reject_nonstandard_texture=reject_nonstandard_texture,
         )
         link = runtime_dir / source.name
         if not link.exists():
@@ -303,6 +418,33 @@ def _runtime_mtl(original_mtl, runtime_dir, path_mappings, texture_roots):
   return runtime_mtl
 
 
+def validate_mtl_textures(
+    mesh_file,
+    path_mappings=None,
+    texture_roots=None,
+    expected_texture_file=None,
+    texture_diagnostics=None,
+    reject_nonstandard_texture=False,
+):
+  """Validate MTL texture references without loading mesh geometry."""
+  mesh_file = Path(mesh_file).expanduser().resolve()
+  if not mesh_file.is_file():
+    raise FileNotFoundError(f"Mesh not found: {mesh_file}")
+  original_mtl = mesh_file.with_suffix(".mtl")
+  if not original_mtl.is_file():
+    raise FileNotFoundError(f"MTL not found beside mesh: {original_mtl}")
+  with tempfile.TemporaryDirectory(prefix="foundationpose_asset_check_") as temp:
+    _runtime_mtl(
+        original_mtl,
+        Path(temp),
+        path_mappings=path_mappings or [],
+        texture_roots=texture_roots or [],
+        expected_texture_file=expected_texture_file,
+        texture_diagnostics=texture_diagnostics,
+        reject_nonstandard_texture=reject_nonstandard_texture,
+    )
+
+
 @contextmanager
 def load_mesh_readonly(
     mesh_file,
@@ -310,6 +452,9 @@ def load_mesh_readonly(
     path_mappings=None,
     texture_roots=None,
     max_texture_size=4096,
+    expected_texture_file=None,
+    texture_diagnostics=None,
+    reject_nonstandard_texture=False,
 ):
   """Load a textured OBJ without editing OBJ, MTL, or texture source files."""
   mesh_file = Path(mesh_file).expanduser().resolve()
@@ -327,6 +472,9 @@ def load_mesh_readonly(
         runtime_dir,
         path_mappings=path_mappings or [],
         texture_roots=texture_roots or [],
+        expected_texture_file=expected_texture_file,
+        texture_diagnostics=texture_diagnostics,
+        reject_nonstandard_texture=reject_nonstandard_texture,
     )
     mesh = trimesh.load(runtime_dir / mesh_file.name, process=False)
     if isinstance(mesh, trimesh.Scene):

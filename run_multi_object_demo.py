@@ -1,4 +1,4 @@
-"""Estimate poses for every CAD-backed object visible in one synthetic frame.
+"""Estimate poses for every CAD-backed object in independent synthetic frames.
 
 Object selection follows the same scene_meta validation used by the single
 object adapter. Class IDs are resolved through objects_metadata.csv using
@@ -21,6 +21,8 @@ import trimesh
 
 from custom_datareader import (
     CustomSceneReader,
+    NonstandardMapKdError,
+    append_cad_asset_issues,
     load_mesh_readonly,
     load_object_catalog,
     resolve_2025_cad,
@@ -58,7 +60,7 @@ def build_parser():
   parser.add_argument(
       "--frame_id",
       default=None,
-      help="Frame stem to process; defaults to the first RGB frame.",
+      help="Optional frame stem; when omitted, process every RGB frame.",
   )
   parser.add_argument("--mesh_scale", type=float, default=0.001)
   parser.add_argument("--max_image_size", type=int, default=640)
@@ -85,17 +87,36 @@ def load_json(path):
     return json.load(stream)
 
 
-def get_frame_id(scene_dir, camera_name, requested):
+def get_frame_ids(scene_dir, camera_name, requested):
   rgb_dir = Path(scene_dir) / "rgb" / camera_name
   files = sorted(rgb_dir.glob("*.png"))
   if not files:
     raise FileNotFoundError(f"No RGB PNG files found in {rgb_dir}")
   if requested is None:
-    return files[0].stem
+    return [path.stem for path in files]
   path = rgb_dir / f"{requested}.png"
   if not path.is_file():
     raise FileNotFoundError(f"Requested RGB frame not found: {path}")
-  return requested
+  return [requested]
+
+
+def validate_frame_files(scene_dir, camera_name, frame_ids):
+  """Fail before model loading when any selected frame input is incomplete."""
+  required = []
+  for frame_id in frame_ids:
+    required.extend([
+        scene_dir / "depth" / camera_name / f"{frame_id}.npy",
+        scene_dir / "masks" / camera_name / f"{frame_id}.png",
+        scene_dir / "conf" / f"{frame_id}.json",
+        scene_dir / "scene_meta" / f"{frame_id}.json",
+    ])
+  missing = [path for path in required if not path.is_file()]
+  if missing:
+    rendered = "\n  ".join(str(path) for path in missing)
+    raise FileNotFoundError(
+        "Selected RGB frames have missing corresponding input files:\n  "
+        f"{rendered}"
+    )
 
 
 def draw_pose(original, K, pose, to_origin, bbox, extents, class_id, color):
@@ -145,12 +166,9 @@ def main():
   set_logging_format()
   set_seed(0)
   scene_dir = Path(args.scene_dir).expanduser().resolve()
-  frame_id = get_frame_id(scene_dir, args.camera_name, args.frame_id)
-  frame_metadata = load_json(scene_dir / f"{frame_id}.json")
-  scene_metadata = load_json(scene_dir / "scene_meta" / f"{frame_id}.json")
-  scene_class_ids = list(scene_metadata.get("objects", {}).keys())
-  if not scene_class_ids:
-    raise ValueError(f"No objects found in scene metadata for frame {frame_id}")
+  frame_ids = get_frame_ids(scene_dir, args.camera_name, args.frame_id)
+  validate_frame_files(scene_dir, args.camera_name, frame_ids)
+  logging.info("Processing %d frame(s): %s", len(frame_ids), frame_ids)
 
   csv_path = (
       Path(args.objects_metadata).expanduser()
@@ -158,68 +176,20 @@ def main():
       else scene_dir / "objects_metadata.csv"
   )
   object_catalog = load_object_catalog(csv_path)
-  camera = get_camera(frame_metadata, args.camera_name)
-  segmentation_path = (
-      scene_dir / "masks" / args.camera_name / f"{frame_id}.png"
-  )
-  segmentation = imageio.imread(segmentation_path)
-  if segmentation.ndim != 3 or segmentation.shape[2] < 3:
-    raise ValueError(f"Expected colored segmentation at {segmentation_path}")
-  mask_colors = match_class_ids_to_mask_colors(
-      scene_class_ids,
-      frame_metadata,
-      camera,
-      segmentation,
-      args.max_mask_match_distance,
-  )
-
-  jobs = []
-  for class_id in scene_class_ids:
-    names = object_catalog.get(class_id)
-    if names is None:
-      logging.warning("Skipping %s: metadata row is missing in %s", class_id, csv_path)
-      continue
-    cad, attempts = resolve_2025_cad(args.cad_root, names)
-    if cad is None:
-      attempted = ", ".join(
-          f"{item['source_field']}={item['name']!r}"
-          for item in attempts
-      ) or "no non-empty Old_name/Object_name"
-      logging.warning(
-          "Skipping %s: no complete 2025 CAD asset; tried %s",
-          class_id,
-          attempted,
-      )
-      continue
-    if class_id not in mask_colors:
-      logging.warning(
-          "Skipping %s (%s): mask color was not resolved",
-          class_id,
-          cad["name"],
-      )
-      continue
-    jobs.append((class_id, cad, mask_colors[class_id]))
-
-  if not jobs:
-    raise RuntimeError("No scene objects have both a resolved 2025 CAD asset and a mask")
-  logging.info(
-      "Processing %d/%d scene objects: %s",
-      len(jobs),
-      len(scene_class_ids),
-      [class_id for class_id, _, _ in jobs],
-  )
 
   debug_camera_dir = (
       Path(args.debug_dir).expanduser().resolve() / args.camera_name
   )
   combined_dir = debug_camera_dir / "combined"
   combined_dir.mkdir(parents=True, exist_ok=True)
+  cad_issue_log = debug_camera_dir / "cad_asset_issues.json"
+  with cad_issue_log.open("w", encoding="utf-8") as stream:
+    stream.write("[]\n")
 
   # Network weights and rasterizer are object-independent and are loaded once.
   scorer = ScorePredictor()
   refiner = PoseRefinePredictor()
   glctx = dr.RasterizeCudaContext()
-  combined_vis = None
   display_colors = [
       (0, 255, 0),
       (255, 128, 0),
@@ -228,97 +198,232 @@ def main():
       (255, 255, 0),
       (128, 128, 255),
   ]
+  class_display_colors = {}
 
-  for object_index, (class_id, cad, mask_color) in enumerate(jobs):
-    object_debug_dir = debug_camera_dir / class_id
-    (object_debug_dir / "ob_in_cam").mkdir(parents=True, exist_ok=True)
-    (object_debug_dir / "track_vis").mkdir(parents=True, exist_ok=True)
+  for frame_id in frame_ids:
+    logging.info("Frame %s", frame_id)
+    frame_metadata = load_json(scene_dir / "conf" / f"{frame_id}.json")
+    scene_metadata = load_json(
+        scene_dir / "scene_meta" / f"{frame_id}.json"
+    )
+    scene_class_ids = list(scene_metadata.get("objects", {}).keys())
+    if not scene_class_ids:
+      raise ValueError(f"No objects found in scene metadata for frame {frame_id}")
+
+    camera = get_camera(frame_metadata, args.camera_name)
+    segmentation_path = (
+        scene_dir / "masks" / args.camera_name / f"{frame_id}.png"
+    )
+    if not segmentation_path.is_file():
+      raise FileNotFoundError(f"Segmentation file not found: {segmentation_path}")
+    segmentation = imageio.imread(segmentation_path)
+    if segmentation.ndim != 3 or segmentation.shape[2] < 3:
+      raise ValueError(f"Expected colored segmentation at {segmentation_path}")
+    mask_colors = match_class_ids_to_mask_colors(
+        scene_class_ids,
+        frame_metadata,
+        camera,
+        segmentation,
+        args.max_mask_match_distance,
+    )
+
+    jobs = []
+    for class_id in scene_class_ids:
+      names = object_catalog.get(class_id)
+      if names is None:
+        logging.warning(
+            "Skipping %s: metadata row is missing in %s", class_id, csv_path
+        )
+        continue
+      if names["year"] == "2024":
+        cad_name = names["old_name"] or names["object_name"]
+        append_cad_asset_issues(
+            cad_issue_log,
+            [{"issue": "unsupported_cad_year"}],
+            frame_id,
+            class_id,
+            cad_name,
+        )
+        logging.warning(
+            "Skipping %s (%s): 2024 CAD database is not supported",
+            class_id,
+            cad_name,
+        )
+        continue
+      cad, attempts = resolve_2025_cad(args.cad_root, names)
+      if cad is None:
+        attempted = ", ".join(
+            f"{item['source_field']}={item['name']!r}"
+            for item in attempts
+        ) or "no non-empty Old_name/Object_name"
+        logging.warning(
+            "Skipping %s: no complete 2025 CAD asset; tried %s",
+            class_id,
+            attempted,
+        )
+        continue
+      if class_id not in mask_colors:
+        logging.warning(
+            "Skipping %s (%s): mask color was not resolved",
+            class_id,
+            cad["name"],
+        )
+        continue
+      jobs.append((class_id, cad, mask_colors[class_id]))
+
+    if not jobs:
+      raise RuntimeError(
+          f"No objects in frame {frame_id} have both a resolved 2025 CAD "
+          "asset and a mask"
+      )
     logging.info(
-        "Registering %s using %s CAD %s",
-        class_id,
-        cad["source_field"],
-        cad["name"],
+        "Frame %s: processing %d/%d scene objects: %s",
+        frame_id,
+        len(jobs),
+        len(scene_class_ids),
+        [class_id for class_id, _, _ in jobs],
     )
 
-    reader = CustomSceneReader(
-        scene_dir=scene_dir,
-        camera_name=args.camera_name,
-        target_class=class_id,
-        mask_color=mask_color,
-        max_image_size=args.max_image_size,
-    )
-    frame_index = reader.id_strs.index(frame_id)
-    rgb = reader.get_color(frame_index)
-    depth = reader.get_depth(frame_index)
-    mask = reader.get_mask(frame_index)
-    K = reader.get_K(frame_index)
-
-    with load_mesh_readonly(
-        mesh_file=cad["mesh_file"],
-        mesh_scale=args.mesh_scale,
-        texture_roots=[cad["object_dir"]],
-        max_texture_size=args.max_texture_size,
-    ) as mesh:
-      to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
-      bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
-      estimator = FoundationPose(
-          model_pts=mesh.vertices,
-          model_normals=mesh.vertex_normals,
-          mesh=mesh,
-          scorer=scorer,
-          refiner=refiner,
-          debug_dir=str(object_debug_dir),
-          debug=args.debug,
-          glctx=glctx,
-      )
-      estimator.diameter = float(estimator.diameter)
-      pose = estimator.register(
-          K=K,
-          rgb=rgb,
-          depth=depth,
-          ob_mask=mask,
-          iteration=args.est_refine_iter,
-      )
-      np.savetxt(
-          object_debug_dir / "ob_in_cam" / f"{frame_id}.txt",
-          pose.reshape(4, 4),
-      )
-
-      original = reader.get_original_color(frame_index)
-      original_K = reader.get_original_K(frame_index)
-      line_color = display_colors[object_index % len(display_colors)]
-      individual_vis = draw_pose(
-          original.copy(),
-          original_K,
-          pose,
-          to_origin,
-          bbox,
-          extents,
+    combined_vis = None
+    for class_id, cad, mask_color in jobs:
+      object_debug_dir = debug_camera_dir / class_id
+      frame_debug_dir = object_debug_dir / "frames" / frame_id
+      (object_debug_dir / "ob_in_cam").mkdir(parents=True, exist_ok=True)
+      (object_debug_dir / "track_vis").mkdir(parents=True, exist_ok=True)
+      logging.info(
+          "Registering %s using %s CAD %s",
           class_id,
-          line_color,
+          cad["source_field"],
+          cad["name"],
       )
-      imageio.imwrite(
-          object_debug_dir / "track_vis" / f"{frame_id}.png",
-          individual_vis,
+
+      reader = CustomSceneReader(
+          scene_dir=scene_dir,
+          camera_name=args.camera_name,
+          target_class=class_id,
+          mask_color=mask_color,
+          max_image_size=args.max_image_size,
+          validation_frame_id=frame_id,
       )
-      if combined_vis is None:
-        combined_vis = original.copy()
-      combined_vis = draw_pose(
-          combined_vis,
-          original_K,
-          pose,
-          to_origin,
-          bbox,
-          extents,
+      frame_index = reader.id_strs.index(frame_id)
+      rgb = reader.get_color(frame_index)
+      depth = reader.get_depth(frame_index)
+      mask = reader.get_mask(frame_index)
+      K = reader.get_K(frame_index)
+
+      texture_diagnostics = []
+      try:
+        with load_mesh_readonly(
+            mesh_file=cad["mesh_file"],
+            mesh_scale=args.mesh_scale,
+            texture_roots=[cad["object_dir"]],
+            max_texture_size=args.max_texture_size,
+            expected_texture_file=cad["texture_file"],
+            texture_diagnostics=texture_diagnostics,
+            reject_nonstandard_texture=True,
+        ) as mesh:
+          to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
+          bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
+          estimator = FoundationPose(
+              model_pts=mesh.vertices,
+              model_normals=mesh.vertex_normals,
+              mesh=mesh,
+              scorer=scorer,
+              refiner=refiner,
+              debug_dir=str(frame_debug_dir),
+              debug=args.debug,
+              glctx=glctx,
+          )
+          estimator.diameter = float(estimator.diameter)
+          pose = estimator.register(
+              K=K,
+              rgb=rgb,
+              depth=depth,
+              ob_mask=mask,
+              iteration=args.est_refine_iter,
+          )
+          np.savetxt(
+              object_debug_dir / "ob_in_cam" / f"{frame_id}.txt",
+              pose.reshape(4, 4),
+          )
+
+          original = reader.get_original_color(frame_index)
+          original_K = reader.get_original_K(frame_index)
+          if class_id not in class_display_colors:
+            color_index = len(class_display_colors) % len(display_colors)
+            class_display_colors[class_id] = display_colors[color_index]
+          line_color = class_display_colors[class_id]
+          individual_vis = draw_pose(
+              original.copy(),
+              original_K,
+              pose,
+              to_origin,
+              bbox,
+              extents,
+              class_id,
+              line_color,
+          )
+          imageio.imwrite(
+              object_debug_dir / "track_vis" / f"{frame_id}.png",
+              individual_vis,
+          )
+          if combined_vis is None:
+            combined_vis = original.copy()
+          combined_vis = draw_pose(
+              combined_vis,
+              original_K,
+              pose,
+              to_origin,
+              bbox,
+              extents,
+              class_id,
+              line_color,
+          )
+      except (FileNotFoundError, NonstandardMapKdError) as error:
+        texture_issues = [
+            issue for issue in texture_diagnostics
+            if issue["issue"] in {
+                "missing_map_kd_texture",
+                "nonstandard_map_kd",
+            }
+        ]
+        if not texture_issues:
+          raise
+        append_cad_asset_issues(
+            cad_issue_log,
+            texture_issues,
+            frame_id,
+            class_id,
+            cad["name"],
+        )
+        logging.warning(
+            "Skipping %s in frame %s: %s",
+            class_id,
+            frame_id,
+            error,
+        )
+        torch.cuda.empty_cache()
+        continue
+
+      del estimator
+      append_cad_asset_issues(
+          cad_issue_log,
+          texture_diagnostics,
+          frame_id,
           class_id,
-          line_color,
+          cad["name"],
       )
+      torch.cuda.empty_cache()
 
-    del estimator
-    torch.cuda.empty_cache()
-
-  imageio.imwrite(combined_dir / f"{frame_id}.png", combined_vis)
-  logging.info("Combined result saved to %s", combined_dir / f"{frame_id}.png")
+    if combined_vis is None:
+      logging.warning(
+          "Frame %s has no successful object poses; combined image not saved",
+          frame_id,
+      )
+      continue
+    combined_path = combined_dir / f"{frame_id}.png"
+    imageio.imwrite(combined_path, combined_vis)
+    logging.info("Combined result saved to %s", combined_path)
 
 
 if __name__ == "__main__":

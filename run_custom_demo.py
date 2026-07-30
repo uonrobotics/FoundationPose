@@ -17,10 +17,13 @@ import trimesh
 
 from custom_datareader import (
     CustomSceneReader,
+    NonstandardMapKdError,
+    append_cad_asset_issues,
     load_object_catalog,
     load_mesh_readonly,
     parse_path_mappings,
     resolve_2025_cad,
+    validate_mtl_textures,
 )
 from custom_mask_utils import (
     get_camera,
@@ -185,12 +188,43 @@ def main():
         f"of {csv_path}; specify --target_class only when using --mesh_file"
     )
 
+  rgb_dir = scene_dir / "rgb" / args.camera_name
+  rgb_files = sorted(rgb_dir.glob("*.png"))
+  if not rgb_files:
+    raise FileNotFoundError(f"No RGB PNG files found in {rgb_dir}")
+  registration_frame_id = rgb_files[0].stem
+
+  debug_root = Path(args.debug_dir).expanduser().resolve()
+  debug_dir = debug_root / args.camera_name
+  (debug_dir / "track_vis").mkdir(parents=True, exist_ok=True)
+  (debug_dir / "ob_in_cam").mkdir(parents=True, exist_ok=True)
+  cad_issue_log = debug_dir / "cad_asset_issues.json"
+  with cad_issue_log.open("w", encoding="utf-8") as stream:
+    stream.write("[]\n")
+
   if args.mesh_file:
     mesh_file = Path(args.mesh_file).expanduser()
     texture_roots = list(args.texture_root)
+    expected_texture_file = None
+    selected_cad_name = mesh_file.stem
     logging.info("Using explicit mesh override: %s", mesh_file)
   else:
     names = object_catalog[target_class]
+    if names["year"] == "2024":
+      selected_cad_name = names["old_name"] or names["object_name"]
+      append_cad_asset_issues(
+          cad_issue_log,
+          [{"issue": "unsupported_cad_year"}],
+          registration_frame_id,
+          target_class,
+          selected_cad_name,
+      )
+      logging.warning(
+          "Skipping %s (%s): 2024 CAD database is not supported",
+          target_class,
+          selected_cad_name,
+      )
+      return
     cad, attempts = resolve_2025_cad(args.cad_root, names)
     if cad is None:
       attempted = ", ".join(
@@ -202,6 +236,8 @@ def main():
       )
     mesh_file = cad["mesh_file"]
     texture_roots = [str(cad["object_dir"]), *args.texture_root]
+    expected_texture_file = cad["texture_file"]
+    selected_cad_name = cad["name"]
     logging.info(
         "Selected %s via %s=%s; resolved CAD asset using %s=%s",
         target_class,
@@ -216,12 +252,10 @@ def main():
     mask_color = tuple(args.mask_color)
     logging.info("Using explicit mask color override: RGB%s", mask_color)
   else:
-    rgb_dir = scene_dir / "rgb" / args.camera_name
-    rgb_files = sorted(rgb_dir.glob("*.png"))
-    if not rgb_files:
-      raise FileNotFoundError(f"No RGB PNG files found in {rgb_dir}")
-    frame_id = rgb_files[0].stem
-    with (scene_dir / f"{frame_id}.json").open("r", encoding="utf-8") as stream:
+    frame_id = registration_frame_id
+    with (
+        scene_dir / "conf" / f"{frame_id}.json"
+    ).open("r", encoding="utf-8") as stream:
       frame_metadata = json.load(stream)
     scene_meta_path = scene_dir / "scene_meta" / f"{frame_id}.json"
     with scene_meta_path.open("r", encoding="utf-8") as stream:
@@ -248,10 +282,35 @@ def main():
     mask_color = mask_colors[target_class]
     logging.info("Automatically selected mask color RGB%s", mask_color)
 
-  debug_root = Path(args.debug_dir).expanduser().resolve()
-  debug_dir = debug_root / args.camera_name
-  (debug_dir / "track_vis").mkdir(parents=True, exist_ok=True)
-  (debug_dir / "ob_in_cam").mkdir(parents=True, exist_ok=True)
+  texture_diagnostics = []
+  try:
+    validate_mtl_textures(
+        mesh_file=mesh_file,
+        path_mappings=path_mappings,
+        texture_roots=texture_roots,
+        expected_texture_file=expected_texture_file,
+        texture_diagnostics=texture_diagnostics,
+        reject_nonstandard_texture=True,
+    )
+  except (FileNotFoundError, NonstandardMapKdError) as error:
+    texture_issues = [
+        issue for issue in texture_diagnostics
+        if issue["issue"] in {
+            "missing_map_kd_texture",
+            "nonstandard_map_kd",
+        }
+    ]
+    if not texture_issues:
+      raise
+    append_cad_asset_issues(
+        cad_issue_log,
+        texture_issues,
+        registration_frame_id,
+        target_class,
+        selected_cad_name,
+    )
+    logging.warning("Skipping %s: %s", target_class, error)
+    return
 
   reader = CustomSceneReader(
       scene_dir=args.scene_dir,
