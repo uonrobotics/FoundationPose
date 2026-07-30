@@ -156,3 +156,9 @@ data/
 logs/
 !BundleTrack/XMem/inference/data
 run_used.yml
+
+# Output
+debug_cough/
+
+# AI (Codex, etc.)
+AGENTS.md
