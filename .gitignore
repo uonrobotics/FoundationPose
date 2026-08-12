@@ -159,6 +159,8 @@ run_used.yml
 
 # Output
 debug_cough/
+debug_real/
 
-# AI (Codex, etc.)
+# AI (Codex, Claude, etc.)
 AGENTS.md
+.claude/

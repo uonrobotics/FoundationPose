@@ -93,20 +93,13 @@ docker start foundationpose && docker exec -it foundationpose bash
 cd /home/uon/workspace/FoundationPose
 ```
 
-단일 객체 실행기
-```
-python run_custom_demo.py \
-  --cad_name paper_cup \
-  --camera_name top_view_camera \
-  --debug_dir debug_cough \
-  --no_gui
-```
+### 1. 가상환경
 
 단일 객체 실행기
 ```
 python run_custom_demo.py \
   --cad_name paper_cup \
-  --camera_name side_view_camera \
+  --camera_name top_view_camera \
   --debug_dir debug_cough \
   --no_gui
 ```
@@ -119,32 +112,27 @@ python run_multi_object_demo.py \
   --no_gui
 ```
 
-멀티 객체 실행기 (전체 프레임 실행)
-```
-python run_multi_object_demo.py \
-  --camera_name side_view_camera \
-  --debug_dir debug_cough \
-  --no_gui
-```
-
 멀티 객체 실행기 (특정 프레임 실행)
 ```
 python run_multi_object_demo.py \
   --camera_name top_view_camera \
   --frame_id 0002 \
-  --debug_dir debug_cough \ (전체 프레임 실행)
-  --no_gui
-```
-
-멀티 객체 실행기 (특정 프레임 실행)
-```
-python run_multi_object_demo.py \
-  --camera_name side_view_camera \
-  --frame_id 0002 \
   --debug_dir debug_cough \
   --no_gui
 ```
 
+### 2. 실환경
+
+멀티 객체 실행기 (전체 프레임 실행)
+```
+python run_multi_object_demo.py \
+  --scene_dir /media/uon/data/gemini/real_v1/Home/LivingRoom_Kitchen/dining_table \
+  --camera_name top_view_camera \
+  --cad_root /media/uon/data/3d_model/peel3_scan_data_2026 \
+  --objects_metadata /media/uon/data/gemini/objects_metadata.csv \
+  --debug_dir debug_real \
+  --no_gui
+```
 
 ## Reference
 

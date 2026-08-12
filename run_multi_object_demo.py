@@ -30,6 +30,7 @@ from custom_datareader import (
 from custom_mask_utils import (
     get_camera,
     match_class_ids_to_mask_colors,
+    match_class_ids_to_mask_colors_from_semantics_mapping,
 )
 from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
 from Utils import (
@@ -100,16 +101,31 @@ def get_frame_ids(scene_dir, camera_name, requested):
   return [requested]
 
 
-def validate_frame_files(scene_dir, camera_name, frame_ids):
+def detect_domain(scene_dir, frame_id):
+  """Real captures mark themselves with conf.json's "domain": "real"."""
+  conf_path = Path(scene_dir) / "conf" / f"{frame_id}.json"
+  with conf_path.open("r", encoding="utf-8") as stream:
+    conf = json.load(stream)
+  return "real" if conf.get("domain") == "real" else "virtual"
+
+
+def validate_frame_files(scene_dir, camera_name, frame_ids, domain):
   """Fail before model loading when any selected frame input is incomplete."""
+  mask_dir_name = "inst_seg" if domain == "real" else "masks"
+  depth_suffix = ".png" if domain == "real" else ".npy"
   required = []
   for frame_id in frame_ids:
     required.extend([
-        scene_dir / "depth" / camera_name / f"{frame_id}.npy",
-        scene_dir / "masks" / camera_name / f"{frame_id}.png",
+        scene_dir / "depth" / camera_name / f"{frame_id}{depth_suffix}",
+        scene_dir / mask_dir_name / camera_name / f"{frame_id}.png",
         scene_dir / "conf" / f"{frame_id}.json",
         scene_dir / "scene_meta" / f"{frame_id}.json",
     ])
+    if domain == "real":
+      required.append(
+          scene_dir / mask_dir_name / camera_name
+          / f"semantics_mapping_{frame_id}.json"
+      )
   missing = [path for path in required if not path.is_file()]
   if missing:
     rendered = "\n  ".join(str(path) for path in missing)
@@ -167,8 +183,13 @@ def main():
   set_seed(0)
   scene_dir = Path(args.scene_dir).expanduser().resolve()
   frame_ids = get_frame_ids(scene_dir, args.camera_name, args.frame_id)
-  validate_frame_files(scene_dir, args.camera_name, frame_ids)
-  logging.info("Processing %d frame(s): %s", len(frame_ids), frame_ids)
+  domain = detect_domain(scene_dir, frame_ids[0])
+  mask_dir_name = "inst_seg" if domain == "real" else "masks"
+  depth_suffix = ".png" if domain == "real" else ".npy"
+  validate_frame_files(scene_dir, args.camera_name, frame_ids, domain)
+  logging.info(
+      "Processing %d frame(s) [domain=%s]: %s", len(frame_ids), domain, frame_ids
+  )
 
   csv_path = (
       Path(args.objects_metadata).expanduser()
@@ -212,20 +233,29 @@ def main():
 
     camera = get_camera(frame_metadata, args.camera_name)
     segmentation_path = (
-        scene_dir / "masks" / args.camera_name / f"{frame_id}.png"
+        scene_dir / mask_dir_name / args.camera_name / f"{frame_id}.png"
     )
     if not segmentation_path.is_file():
       raise FileNotFoundError(f"Segmentation file not found: {segmentation_path}")
     segmentation = imageio.imread(segmentation_path)
     if segmentation.ndim != 3 or segmentation.shape[2] < 3:
       raise ValueError(f"Expected colored segmentation at {segmentation_path}")
-    mask_colors = match_class_ids_to_mask_colors(
-        scene_class_ids,
-        frame_metadata,
-        camera,
-        segmentation,
-        args.max_mask_match_distance,
-    )
+    if domain == "real":
+      mask_colors = match_class_ids_to_mask_colors_from_semantics_mapping(
+          scene_class_ids,
+          scene_dir,
+          args.camera_name,
+          frame_id,
+          mask_dir_name,
+      )
+    else:
+      mask_colors = match_class_ids_to_mask_colors(
+          scene_class_ids,
+          frame_metadata,
+          camera,
+          segmentation,
+          args.max_mask_match_distance,
+      )
 
     jobs = []
     for class_id in scene_class_ids:
@@ -304,6 +334,8 @@ def main():
           mask_color=mask_color,
           max_image_size=args.max_image_size,
           validation_frame_id=frame_id,
+          mask_dir_name=mask_dir_name,
+          depth_suffix=depth_suffix,
       )
       frame_index = reader.id_strs.index(frame_id)
       rgb = reader.get_color(frame_index)

@@ -1,8 +1,11 @@
-"""Match synthetic scene object IDs to colors in instance segmentation images."""
+"""Match scene object IDs to colors in instance segmentation images."""
 
 from __future__ import annotations
 
+import ast
+import json
 import logging
+from pathlib import Path
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -113,4 +116,52 @@ def match_class_ids_to_mask_colors(
         colors[col],
         distance,
     )
+  return matches
+
+
+def load_semantics_mapping(scene_dir, camera_name, frame_id, mask_dir_name="inst_seg"):
+  """Load the real-domain color->class_id lookup shipped beside each mask."""
+  path = (
+      Path(scene_dir) / mask_dir_name / camera_name
+      / f"semantics_mapping_{frame_id}.json"
+  )
+  if not path.is_file():
+    raise FileNotFoundError(f"Semantics mapping not found: {path}")
+  with path.open("r", encoding="utf-8") as stream:
+    raw = json.load(stream)
+  mapping = {}
+  for color_key, entry in raw.items():
+    class_id = entry.get("class")
+    if class_id in (None, "BACKGROUND", "UNLABELLED"):
+      continue
+    color = ast.literal_eval(color_key)
+    mapping[class_id] = tuple(int(value) for value in color[:3])
+  return mapping
+
+
+def match_class_ids_to_mask_colors_from_semantics_mapping(
+    scene_class_ids,
+    scene_dir,
+    camera_name,
+    frame_id,
+    mask_dir_name="inst_seg",
+):
+  """Match GT-free real-domain classes to mask colors via the shipped lookup.
+
+  Real captures have no synthetic GT object position (no cam_poses/translate
+  to project), so unlike match_class_ids_to_mask_colors this reads the
+  explicit color->class_id table the capture pipeline already produced.
+  """
+  mapping = load_semantics_mapping(scene_dir, camera_name, frame_id, mask_dir_name)
+  matches = {}
+  for class_id in scene_class_ids:
+    if class_id not in mapping:
+      logging.warning(
+          "Skipping %s: no entry in semantics mapping for frame %s",
+          class_id,
+          frame_id,
+      )
+      continue
+    matches[class_id] = mapping[class_id]
+    logging.info("Mask match: %s -> RGB%s (semantics mapping)", class_id, mapping[class_id])
   return matches

@@ -126,7 +126,13 @@ def append_cad_asset_issues(log_path, issues, frame_id, class_id, cad_name):
 
 
 class CustomSceneReader:
-  """Read RGB PNG, float32 NPY depth, colored masks, and frame JSON metadata."""
+  """Read RGB PNG, depth (NPY or PNG), colored masks, and frame JSON metadata.
+
+  Virtual (Isaac-sim) scenes store depth as float32-meter .npy and colored
+  masks under a "masks" folder. Real captures store depth as uint16-mm .png
+  (aligned to the color frame) and colored masks under an "inst_seg" folder;
+  pass depth_suffix=".png" and mask_dir_name="inst_seg" for those.
+  """
 
   def __init__(
       self,
@@ -136,20 +142,25 @@ class CustomSceneReader:
       mask_color=(255, 25, 25),
       max_image_size=640,
       validation_frame_id=None,
+      mask_dir_name="masks",
+      depth_suffix=".npy",
   ):
     self.scene_dir = Path(scene_dir).expanduser().resolve()
     self.camera_name = camera_name
     self.target_class = target_class
     self.mask_color = np.asarray(mask_color, dtype=np.uint8).reshape(3)
+    self.mask_dir_name = mask_dir_name
+    self.depth_suffix = depth_suffix
     camera_rgb_dir = self.scene_dir / "rgb" / self.camera_name
     self.camera_subdirs = camera_rgb_dir.is_dir()
+    folder_dir_names = {"rgb": "rgb", "depth": "depth", "masks": mask_dir_name}
     self.data_dirs = {
-        folder: (
-            self.scene_dir / folder / self.camera_name
+        key: (
+            self.scene_dir / dirname / self.camera_name
             if self.camera_subdirs
-            else self.scene_dir / folder
+            else self.scene_dir / dirname
         )
-        for folder in ("rgb", "depth", "masks")
+        for key, dirname in folder_dir_names.items()
     }
     if self.camera_subdirs:
       missing = [
@@ -234,7 +245,13 @@ class CustomSceneReader:
           f"Expected one camera named {self.camera_name!r}, found {len(matches)}; "
           f"available cameras: {available}"
       )
-    K = np.asarray(matches[0]["intrinsic_isaac"], dtype=np.float32).reshape(3, 3)
+    intrinsic = matches[0].get("intrinsic_isaac", matches[0].get("intrinsic"))
+    if intrinsic is None:
+      raise KeyError(
+          f"Camera {self.camera_name!r} entry has neither 'intrinsic_isaac' "
+          "nor 'intrinsic'"
+      )
+    K = np.asarray(intrinsic, dtype=np.float32).reshape(3, 3)
     output_size = matches[0].get("output_size")
     if output_size is not None and tuple(output_size) != (self.source_W, self.source_H):
       raise ValueError(
@@ -256,12 +273,14 @@ class CustomSceneReader:
     return np.ascontiguousarray(color)
 
   def get_depth(self, i):
-    path = self._path("depth", i, ".npy")
+    path = self._path("depth", i, self.depth_suffix)
     if not path.exists():
       raise FileNotFoundError(f"Depth file not found: {path}")
-    depth = np.load(path, allow_pickle=False)
-    if depth.dtype != np.float32:
-      depth = depth.astype(np.float32)
+    if self.depth_suffix == ".npy":
+      depth = np.load(path, allow_pickle=False).astype(np.float32, copy=False)
+    else:
+      # Real captures save aligned uint16 depth in millimeters.
+      depth = imageio.imread(path).astype(np.float32, copy=False) / 1000.0
     if depth.ndim != 2:
       raise ValueError(f"Depth must be HxW, got {depth.shape} from {path}")
     if self.scale != 1.0:
@@ -378,6 +397,26 @@ def _resolve_texture_path(
   raise FileNotFoundError(f"Could not resolve texture {raw_path!r}; tried:\n  {rendered}")
 
 
+def _used_material_names(mesh_file):
+  """Collect material names an OBJ actually assigns to faces via usemtl.
+
+  Exported MTLs can carry leftover materials from editing history (e.g. a
+  Blender material pointing at a texture that was never re-exported next to
+  the asset). Those are never loaded by trimesh, so they must not block
+  loading the materials the mesh actually uses.
+  """
+  names = set()
+  with Path(mesh_file).open("r", encoding="utf-8", errors="replace") as stream:
+    for line in stream:
+      stripped = line.strip()
+      if not stripped.startswith("usemtl"):
+        continue
+      tokens = stripped.split(None, 1)
+      if len(tokens) == 2:
+        names.add(tokens[1].strip())
+  return names
+
+
 def _runtime_mtl(
     original_mtl,
     runtime_dir,
@@ -386,8 +425,10 @@ def _runtime_mtl(
     expected_texture_file=None,
     texture_diagnostics=None,
     reject_nonstandard_texture=False,
+    used_material_names=None,
 ):
   output_lines = []
+  current_material = None
   with original_mtl.open("r", encoding="utf-8") as stream:
     for line in stream:
       stripped = line.strip()
@@ -395,7 +436,19 @@ def _runtime_mtl(
         output_lines.append(line)
         continue
       tokens = shlex.split(stripped, comments=False, posix=True)
+      if tokens and tokens[0].lower() == "newmtl" and len(tokens) >= 2:
+        current_material = tokens[1]
+        output_lines.append(line)
+        continue
       if tokens and tokens[0].lower() == "map_kd" and len(tokens) >= 2:
+        if (
+            used_material_names is not None
+            and current_material not in used_material_names
+        ):
+          # Unreferenced material: leave its map_Kd untouched instead of
+          # resolving/validating a texture the mesh will never load.
+          output_lines.append(line)
+          continue
         # The current dataset has no map options. Taking the last token also
         # handles the common option-bearing form, e.g. "map_Kd -s 1 1 1 x.png".
         source = _resolve_texture_path(
@@ -442,6 +495,7 @@ def validate_mtl_textures(
         expected_texture_file=expected_texture_file,
         texture_diagnostics=texture_diagnostics,
         reject_nonstandard_texture=reject_nonstandard_texture,
+        used_material_names=_used_material_names(mesh_file),
     )
 
 
@@ -475,6 +529,7 @@ def load_mesh_readonly(
         expected_texture_file=expected_texture_file,
         texture_diagnostics=texture_diagnostics,
         reject_nonstandard_texture=reject_nonstandard_texture,
+        used_material_names=_used_material_names(mesh_file),
     )
     mesh = trimesh.load(runtime_dir / mesh_file.name, process=False)
     if isinstance(mesh, trimesh.Scene):
