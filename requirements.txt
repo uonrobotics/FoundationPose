@@ -1,43 +1,43 @@
-# Install PyTorch first (CUDA build must match your driver; cu124 works on most recent NVIDIA GPUs):
-#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+# Install PyTorch first (must match your CUDA driver; verified working combo below):
+#   pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 #
-# Then GPU extensions (need nvcc; set CUDA_HOME to your toolkit, e.g. /usr/local/cuda):
-#   pip install --no-build-isolation git+https://github.com/facebookresearch/pytorch3d.git
-#   pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast.git
+# Then GPU extensions (need nvcc; set CUDA_HOME to your toolkit, e.g. /usr/local/cuda; gcc/g++ 13.x required for CUDA 12.4):
+#   pip install --no-build-isolation git+https://github.com/facebookresearch/pytorch3d.git@2bce7110d5621ef2a349a72ac3aacbfba8bfb461
+#   pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast.git@253ac4fcea7de5f396371124af597e6cc957bfae
 #
 # Then this file:
 #   pip install -r requirements.txt
 
 # Core numerics & IO
-numpy>=2
-scipy
-scikit-learn
-h5py
-joblib
+numpy==2.4.6
+scipy==1.17.1
+scikit-learn==1.9.0
+h5py==3.16.0
+joblib==1.5.3
 
 # Config / serialization
-PyYAML>=6
-ruamel.yaml>=0.18
+PyYAML==6.0.3
+ruamel.yaml==0.19.1
 
 # Vision & 3D
-opencv-python
-imageio
-open3d
-trimesh
-transformations
-matplotlib
-pandas
-Pillow
-pyrender
-pyOpenGL>=3.1
-pyOpenGL_accelerate>=3.1
+opencv-python==5.0.0.93
+imageio==2.37.4
+open3d==0.19.0
+trimesh==5.0.0
+transformations==2026.1.18
+matplotlib==3.11.1
+pandas==3.0.5
+Pillow==12.3.0
+pyrender==0.1.45
+PyOpenGL==3.1.0
+PyOpenGL-accelerate==3.1.10
 
 # Inference stack (torch installed separately)
-kornia>=0.7
-omegaconf>=2.3
-psutil
-tqdm
-warp-lang
+kornia==0.8.3
+omegaconf==2.3.1
+psutil==7.2.2
+tqdm==4.70.0
+warp-lang==1.16.0
 
 # Optional: faster / utility (import guarded in code)
-scikit-image
+scikit-image==0.26.0

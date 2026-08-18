@@ -44,6 +44,8 @@ def vis_batch_data_scores(pose_data, ids, scores, pad_margin=5):
       row = np.concatenate([rgbA_vis, pad, depthA_vis, pad, rgbB_vis, pad, depthB_vis], axis=1)
     s = 100/row.shape[0]
     row = cv2.resize(row, fx=s, fy=s, dsize=None)
+    # 최신 OpenCV의 putText는 uint8 이미지만 받으므로 미리 캐스팅
+    row = np.clip(row, 0, 255).astype(np.uint8)
     row = cv_draw_text(row, text=f'id:{id}, score:{scores[id]:.3f}', uv_top_left=(10,10), color=(0,255,0), fontScale=0.5)
     canvas.append(row)
     pad = np.ones((pad_margin, row.shape[1], 3))*255

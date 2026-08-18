@@ -20,6 +20,7 @@ import imageio
 import numpy as np
 import trimesh
 from PIL import Image
+from trimesh import resolvers
 
 
 class NonstandardMapKdError(ValueError):
@@ -531,7 +532,11 @@ def load_mesh_readonly(
         reject_nonstandard_texture=reject_nonstandard_texture,
         used_material_names=_used_material_names(mesh_file),
     )
-    mesh = trimesh.load(runtime_dir / mesh_file.name, process=False)
+    # 최신 trimesh는 runtime_dir 밖을 가리키는 심링크(텍스처)를 거부하므로 허용 처리
+    resolver = resolvers.FilePathResolver(str(runtime_dir), allow_anywhere=True)
+    mesh = trimesh.load(
+        runtime_dir / mesh_file.name, process=False, resolver=resolver
+    )
     if isinstance(mesh, trimesh.Scene):
       if len(mesh.geometry) != 1:
         raise ValueError(
