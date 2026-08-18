@@ -62,6 +62,7 @@ conda activate foundationpose
 ```bash
 python run_custom_demo.py \
   --cad_name paper_cup \
+  --cad_root /media/uon/data1/3d_model/peel3_scan_data_2025 \
   --camera_name top_view_camera \
   --debug_dir debug_cough \
   --no_gui
@@ -70,6 +71,7 @@ python run_custom_demo.py \
 멀티 객체 실행기 (전체 프레임 실행)
 ```bash
 python run_multi_object_demo.py \
+  --cad_root /media/uon/data1/3d_model/peel3_scan_data_2025 \
   --camera_name top_view_camera \
   --debug_dir debug_cough \
   --no_gui
@@ -78,6 +80,7 @@ python run_multi_object_demo.py \
 멀티 객체 실행기 (특정 프레임 실행)
 ```bash
 python run_multi_object_demo.py \
+  --cad_root /media/uon/data1/3d_model/peel3_scan_data_2025 \
   --camera_name top_view_camera \
   --frame_id 0002 \
   --debug_dir debug_cough \
