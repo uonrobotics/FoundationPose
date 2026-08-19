@@ -1,3 +1,10 @@
+# FoundationPose Custom (uonrobotics fork)
+
+이 fork는 upstream [FoundationPose](https://github.com/NVlabs/FoundationPose)에 실행기
+2개를 추가합니다: 단일 객체 실행기(첫 프레임 Pose Estimation → 이후 Tracking, 실증용)와
+멀티 객체 실행기(전체 프레임·객체 일괄 Pose Estimation, 데이터 구축용). 기본 설치는
+upstream [`readme.md`](readme.md)를 따르고, 이 문서는 추가된 실행기만 다룹니다.
+
 ## Installation
 
 ### 1. Env setup option 1: docker
