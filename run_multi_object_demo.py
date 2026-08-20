@@ -1,18 +1,20 @@
-"""Estimate poses for every CAD-backed object in independent synthetic frames.
+"""Scene의 frame마다, 그 frame에 있는 객체를 전부 골라 6D pose를 계산한다.
 
-Object selection follows the same scene_meta validation used by the single
-object adapter. Class IDs are resolved through objects_metadata.csv using
-Old_name first and Object_name when the Old_name asset is unavailable.
+run_one_object_demo.py와 거의 같고, 한 frame에 객체가 여러 개일 수 있다는 점만
+다르다. 카메라 한 대만 쓰고, 추적 없이 frame마다 새로 계산한다. 산출물 폴더
+이름에는 전부 "_multi"를 붙여서 run_one_object_demo.py 결과와 안 섞이게 한다.
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
-import cv2
 import imageio
 import nvdiffrast.torch as dr
 import numpy as np
@@ -21,11 +23,16 @@ import trimesh
 
 from custom_datareader import (
     CustomSceneReader,
-    NonstandardMapKdError,
-    append_cad_asset_issues,
+    append_issue_jsonl,
+    atomic_write_bytes,
+    detect_domain,
+    draw_pose,
+    get_frame_ids,
+    load_json,
     load_mesh_readonly,
     load_object_catalog,
-    resolve_2025_cad,
+    resolve_cad_by_year,
+    validate_frame_files,
 )
 from custom_mask_utils import (
     get_camera,
@@ -33,31 +40,43 @@ from custom_mask_utils import (
     match_class_ids_to_mask_colors_from_semantics_mapping,
 )
 from estimater import FoundationPose, PoseRefinePredictor, ScorePredictor
-from Utils import (
-    draw_posed_3d_box,
-    draw_xyz_axis,
-    project_3d_to_2d,
-    set_logging_format,
-    set_seed,
-)
+from Utils import set_logging_format, set_seed
 
 
 def build_parser():
-  code_dir = Path(__file__).resolve().parent
   parser = argparse.ArgumentParser(
-      description="Run sequential multi-object FoundationPose on synthetic RGB-D."
-  )
-  parser.add_argument("--scene_dir", default=str(code_dir / "demo_data" / "cough"))
-  parser.add_argument(
-      "--cad_root",
-      default="/media/uon/data/3d_model/peel3_scan_data_2025",
+      description=(
+          "Batch 6D pose estimation over one scene, every CAD-backed "
+          "object in every frame, no temporal tracking."
+      )
   )
   parser.add_argument(
-      "--objects_metadata",
-      default=None,
-      help="Defaults to <scene_dir>/objects_metadata.csv.",
+      "--dataset-root",
+      type=Path,
+      required=True,
+      help="Top-level dataset folder that holds objects_metadata.csv, e.g. "
+      "/media/uon/data1/gemini",
   )
-  parser.add_argument("--camera_name", default="top_view_camera")
+  parser.add_argument(
+      "--scene",
+      required=True,
+      help="Scene path relative to --dataset-root, e.g. "
+      "real_v1/home/LivingRoom_Kitchen/dining_table",
+  )
+  parser.add_argument(
+      "--camera_name",
+      default="top_view_camera",
+      help="Pose is only meaningful in one camera's own coordinate frame "
+      "(no inter-camera calibration yet), so only one camera is processed "
+      "per run.",
+  )
+  parser.add_argument(
+      "--cad-root",
+      default="/media/uon/data1/3d_model",
+      help="Parent of the year-specific CAD folders "
+      "(<cad-root>/peel3_scan_data_<Year>), matched to each object's own "
+      "catalog Year.",
+  )
   parser.add_argument(
       "--frame_id",
       default=None,
@@ -70,104 +89,93 @@ def build_parser():
       "--max_mask_match_distance",
       type=float,
       default=250.0,
-      help="Maximum source-image pixel distance for GT center to mask-color matching.",
+      help="Virtual domain only: maximum source-image pixel distance for "
+      "GT center to mask-color matching.",
   )
   parser.add_argument("--est_refine_iter", type=int, default=5)
-  parser.add_argument("--debug", type=int, default=2)
-  parser.add_argument("--debug_dir", default=str(code_dir / "debug_cough"))
   parser.add_argument(
-      "--no_gui",
-      action="store_true",
-      help="Accepted for single-runner CLI parity; this runner saves files only.",
+      "--debug",
+      type=int,
+      default=2,
+      help="FoundationPose internal debug verbosity, written under "
+      "6d_pose_multi_debug/<frame_id>/<class_id>/.",
+  )
+  parser.add_argument(
+      "--save-diagnostics",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help="Write per-object and per-frame-combined pose visualizations "
+      "under diagnostics/ (default: enabled).",
   )
   return parser
 
 
-def load_json(path):
-  with Path(path).open("r", encoding="utf-8") as stream:
-    return json.load(stream)
-
-
-def get_frame_ids(scene_dir, camera_name, requested):
-  rgb_dir = Path(scene_dir) / "rgb" / camera_name
-  files = sorted(rgb_dir.glob("*.png"))
-  if not files:
-    raise FileNotFoundError(f"No RGB PNG files found in {rgb_dir}")
-  if requested is None:
-    return [path.stem for path in files]
-  path = rgb_dir / f"{requested}.png"
-  if not path.is_file():
-    raise FileNotFoundError(f"Requested RGB frame not found: {path}")
-  return [requested]
-
-
-def detect_domain(scene_dir, frame_id):
-  """Real captures mark themselves with conf.json's "domain": "real"."""
-  conf_path = Path(scene_dir) / "conf" / f"{frame_id}.json"
-  with conf_path.open("r", encoding="utf-8") as stream:
-    conf = json.load(stream)
-  return "real" if conf.get("domain") == "real" else "virtual"
-
-
-def validate_frame_files(scene_dir, camera_name, frame_ids, domain):
-  """Fail before model loading when any selected frame input is incomplete."""
-  mask_dir_name = "inst_seg" if domain == "real" else "masks"
-  depth_suffix = ".png" if domain == "real" else ".npy"
-  required = []
-  for frame_id in frame_ids:
-    required.extend([
-        scene_dir / "depth" / camera_name / f"{frame_id}{depth_suffix}",
-        scene_dir / mask_dir_name / camera_name / f"{frame_id}.png",
-        scene_dir / "conf" / f"{frame_id}.json",
-        scene_dir / "scene_meta" / f"{frame_id}.json",
-    ])
-    if domain == "real":
-      required.append(
-          scene_dir / mask_dir_name / camera_name
-          / f"semantics_mapping_{frame_id}.json"
+def discover_frame_ids(scene_dir, camera_name, requested_frame_id):
+  """Build an ordered frame_id worklist for one camera."""
+  ordered = []
+  for frame_id in get_frame_ids(scene_dir, camera_name, requested_frame_id):
+    try:
+      sort_key = int(frame_id)
+    except ValueError:
+      print(
+          f"run-multi-object-demo: skipping malformed frame id {frame_id!r}",
+          file=sys.stderr,
       )
-  missing = [path for path in required if not path.is_file()]
-  if missing:
-    rendered = "\n  ".join(str(path) for path in missing)
-    raise FileNotFoundError(
-        "Selected RGB frames have missing corresponding input files:\n  "
-        f"{rendered}"
-    )
+      continue
+    ordered.append((sort_key, frame_id))
+  # 숫자로 정렬: 문자열로 정렬하면 "10000"이 "9999"보다 앞에 온다.
+  ordered.sort()
+  return [frame_id for _, frame_id in ordered]
 
 
-def draw_pose(original, K, pose, to_origin, bbox, extents, class_id, color):
-  center_pose = pose @ np.linalg.inv(to_origin)
-  linewidth = 7
-  vis = draw_posed_3d_box(
-      K,
-      img=original,
-      ob_in_cam=center_pose,
-      bbox=bbox,
-      line_color=color,
-      linewidth=linewidth,
+def load_frame_poses(scene_dir, frame_id):
+  """Read this frame's existing {class_id: {object_id, ob_in_cam}} map."""
+  path = scene_dir / "6d_pose_multi_json" / f"{frame_id}.json"
+  if not path.is_file():
+    return {}
+  return load_json(path)
+
+
+def render_pose_txt(frame_poses):
+  """One np.savetxt block per object, labeled with a '# <class_id>' line."""
+  buffer = io.StringIO()
+  for class_id, entry in frame_poses.items():
+    buffer.write(f"# {class_id}\n")
+    np.savetxt(buffer, np.asarray(entry["ob_in_cam"], dtype=np.float64))
+    buffer.write("\n")
+  return buffer.getvalue()
+
+
+def save_frame_poses(scene_dir, frame_id, frame_poses):
+  pose_json_path = scene_dir / "6d_pose_multi_json" / f"{frame_id}.json"
+  atomic_write_bytes(
+      pose_json_path, json.dumps(frame_poses, indent=2).encode("utf-8"),
   )
-  axis_scale = max(float(extents.max()) * 0.5, 0.01)
-  vis = draw_xyz_axis(
-      vis,
-      ob_in_cam=center_pose,
-      scale=axis_scale,
-      K=K,
-      thickness=linewidth,
-      transparency=0,
-      is_input_rgb=True,
-  )
-  uv = project_3d_to_2d(np.asarray([0, 0, 0, 1]), K, center_pose)
-  cv2.putText(
-      vis,
-      class_id,
-      tuple(int(value) for value in uv),
-      cv2.FONT_HERSHEY_SIMPLEX,
-      1.0,
-      color,
-      2,
-      cv2.LINE_AA,
-  )
-  return vis
+  pose_txt_path = scene_dir / "6d_pose_multi" / f"{frame_id}.txt"
+  atomic_write_bytes(pose_txt_path, render_pose_txt(frame_poses).encode("utf-8"))
+
+
+def log_issue(issues_path, *, camera_name, frame_id, class_id, issue, message):
+  append_issue_jsonl(issues_path, {
+      "logged_at_utc": datetime.now(timezone.utc).isoformat(),
+      "camera_name": camera_name,
+      "frame_id": frame_id,
+      "class_id": class_id,
+      "issue": issue,
+      "message": message,
+  })
+
+
+_ANSI_RESET = "\033[0m"
+_ANSI_BOLD_GREEN = "\033[1;32m"
+_ANSI_BOLD_RED = "\033[1;31m"
+
+
+def _highlight(text, ansi_code):
+  """TTY에 출력될 때만 색을 입힌다 (파일로 리다이렉트되면 평문 그대로)."""
+  if not sys.stdout.isatty():
+    return text
+  return f"{ansi_code}{text}{_ANSI_RESET}"
 
 
 def main():
@@ -181,36 +189,26 @@ def main():
 
   set_logging_format()
   set_seed(0)
-  scene_dir = Path(args.scene_dir).expanduser().resolve()
-  frame_ids = get_frame_ids(scene_dir, args.camera_name, args.frame_id)
-  domain = detect_domain(scene_dir, frame_ids[0])
-  mask_dir_name = "inst_seg" if domain == "real" else "masks"
-  depth_suffix = ".png" if domain == "real" else ".npy"
-  validate_frame_files(scene_dir, args.camera_name, frame_ids, domain)
-  logging.info(
-      "Processing %d frame(s) [domain=%s]: %s", len(frame_ids), domain, frame_ids
-  )
 
-  csv_path = (
-      Path(args.objects_metadata).expanduser()
-      if args.objects_metadata
-      else scene_dir / "objects_metadata.csv"
-  )
-  object_catalog = load_object_catalog(csv_path)
+  dataset_root = args.dataset_root.expanduser().resolve()
+  metadata_path = dataset_root / "objects_metadata.csv"
+  if not metadata_path.is_file():
+    raise FileNotFoundError(f"objects_metadata.csv not found: {metadata_path}")
+  scene_dir = (dataset_root / args.scene).resolve()
+  camera_name = args.camera_name
 
-  debug_camera_dir = (
-      Path(args.debug_dir).expanduser().resolve() / args.camera_name
-  )
-  combined_dir = debug_camera_dir / "combined"
-  combined_dir.mkdir(parents=True, exist_ok=True)
-  cad_issue_log = debug_camera_dir / "cad_asset_issues.json"
-  with cad_issue_log.open("w", encoding="utf-8") as stream:
-    stream.write("[]\n")
+  object_catalog = load_object_catalog(metadata_path)
+  frame_ids = discover_frame_ids(scene_dir, camera_name, args.frame_id)
+  if not frame_ids:
+    logging.info("No frames to process in %s [%s]", scene_dir, camera_name)
+    return
 
-  # Network weights and rasterizer are object-independent and are loaded once.
+  issues_path = scene_dir / "inference_meta" / "foundationpose" / "cad_asset_issues_multi.jsonl"
+
   scorer = ScorePredictor()
   refiner = PoseRefinePredictor()
   glctx = dr.RasterizeCudaContext()
+  cad_cache = {}
   display_colors = [
       (0, 255, 0),
       (255, 128, 0),
@@ -221,130 +219,106 @@ def main():
   ]
   class_display_colors = {}
 
+  processed = skipped = failed = 0
+
   for frame_id in frame_ids:
-    logging.info("Frame %s", frame_id)
-    frame_metadata = load_json(scene_dir / "conf" / f"{frame_id}.json")
-    scene_metadata = load_json(
-        scene_dir / "scene_meta" / f"{frame_id}.json"
-    )
-    scene_class_ids = list(scene_metadata.get("objects", {}).keys())
-    if not scene_class_ids:
-      raise ValueError(f"No objects found in scene metadata for frame {frame_id}")
+    try:
+      domain = detect_domain(scene_dir, frame_id)
+      mask_dir_name = "inst_seg" if domain == "real" else "masks"
+      depth_suffix = ".png" if domain == "real" else ".npy"
+      validate_frame_files(scene_dir, camera_name, [frame_id], domain)
 
-    camera = get_camera(frame_metadata, args.camera_name)
-    segmentation_path = (
-        scene_dir / mask_dir_name / args.camera_name / f"{frame_id}.png"
-    )
-    if not segmentation_path.is_file():
-      raise FileNotFoundError(f"Segmentation file not found: {segmentation_path}")
-    segmentation = imageio.imread(segmentation_path)
-    if segmentation.ndim != 3 or segmentation.shape[2] < 3:
-      raise ValueError(f"Expected colored segmentation at {segmentation_path}")
-    if domain == "real":
-      mask_colors = match_class_ids_to_mask_colors_from_semantics_mapping(
-          scene_class_ids,
-          scene_dir,
-          args.camera_name,
-          frame_id,
-          mask_dir_name,
-      )
-    else:
-      mask_colors = match_class_ids_to_mask_colors(
-          scene_class_ids,
-          frame_metadata,
-          camera,
-          segmentation,
-          args.max_mask_match_distance,
-      )
+      scene_metadata = load_json(scene_dir / "scene_meta" / f"{frame_id}.json")
+      scene_objects = scene_metadata.get("objects", {})
+      scene_class_ids = list(scene_objects.keys())
+      if not scene_class_ids:
+        logging.info("%s: no objects in scene_meta; skipping", frame_id)
+        skipped += 1
+        continue
 
-    jobs = []
-    for class_id in scene_class_ids:
-      names = object_catalog.get(class_id)
-      if names is None:
-        logging.warning(
-            "Skipping %s: metadata row is missing in %s", class_id, csv_path
-        )
+      frame_poses = load_frame_poses(scene_dir, frame_id)
+      pending_class_ids = [
+          class_id for class_id in scene_class_ids if class_id not in frame_poses
+      ]
+      skipped += len(scene_class_ids) - len(pending_class_ids)
+      if not pending_class_ids:
         continue
-      if names["year"] == "2024":
-        cad_name = names["old_name"] or names["object_name"]
-        append_cad_asset_issues(
-            cad_issue_log,
-            [{"issue": "unsupported_cad_year"}],
-            frame_id,
-            class_id,
-            cad_name,
-        )
-        logging.warning(
-            "Skipping %s (%s): 2024 CAD database is not supported",
-            class_id,
-            cad_name,
-        )
-        continue
-      cad, attempts = resolve_2025_cad(args.cad_root, names)
-      if cad is None:
-        attempted = ", ".join(
-            f"{item['source_field']}={item['name']!r}"
-            for item in attempts
-        ) or "no non-empty Old_name/Object_name"
-        logging.warning(
-            "Skipping %s: no complete 2025 CAD asset; tried %s",
-            class_id,
-            attempted,
-        )
-        continue
-      if class_id not in mask_colors:
-        logging.warning(
-            "Skipping %s (%s): mask color was not resolved",
-            class_id,
-            cad["name"],
-        )
-        continue
-      jobs.append((class_id, cad, mask_colors[class_id]))
 
-    if not jobs:
-      raise RuntimeError(
-          f"No objects in frame {frame_id} have both a resolved 2025 CAD "
-          "asset and a mask"
+      if domain == "virtual":
+        frame_metadata = load_json(scene_dir / "conf" / f"{frame_id}.json")
+        segmentation_path = scene_dir / mask_dir_name / camera_name / f"{frame_id}.png"
+        segmentation = imageio.imread(segmentation_path)
+        if segmentation.ndim != 3 or segmentation.shape[2] < 3:
+          raise ValueError(f"Expected colored segmentation at {segmentation_path}")
+        mask_colors = match_class_ids_to_mask_colors(
+            pending_class_ids,
+            frame_metadata,
+            get_camera(frame_metadata, camera_name),
+            segmentation,
+            args.max_mask_match_distance,
+        )
+      else:
+        mask_colors = match_class_ids_to_mask_colors_from_semantics_mapping(
+            pending_class_ids, scene_dir, camera_name, frame_id, mask_dir_name,
+        )
+    except Exception as error:  # noqa: BLE001 - one failing frame must not stop the batch
+      failed += 1
+      log_issue(
+          issues_path,
+          camera_name=camera_name,
+          frame_id=frame_id,
+          class_id=None,
+          issue=type(error).__name__,
+          message=str(error),
       )
-    logging.info(
-        "Frame %s: processing %d/%d scene objects: %s",
-        frame_id,
-        len(jobs),
-        len(scene_class_ids),
-        [class_id for class_id, _, _ in jobs],
-    )
+      logging.warning("%s [%s]: frame FAILED (%s)", frame_id, camera_name, error)
+      continue
 
     combined_vis = None
-    for class_id, cad, mask_color in jobs:
-      object_debug_dir = debug_camera_dir / class_id
-      frame_debug_dir = object_debug_dir / "frames" / frame_id
-      (object_debug_dir / "ob_in_cam").mkdir(parents=True, exist_ok=True)
-      (object_debug_dir / "track_vis").mkdir(parents=True, exist_ok=True)
-      logging.info(
-          "Registering %s using %s CAD %s",
-          class_id,
-          cad["source_field"],
-          cad["name"],
-      )
-
-      reader = CustomSceneReader(
-          scene_dir=scene_dir,
-          camera_name=args.camera_name,
-          target_class=class_id,
-          mask_color=mask_color,
-          max_image_size=args.max_image_size,
-          validation_frame_id=frame_id,
-          mask_dir_name=mask_dir_name,
-          depth_suffix=depth_suffix,
-      )
-      frame_index = reader.id_strs.index(frame_id)
-      rgb = reader.get_color(frame_index)
-      depth = reader.get_depth(frame_index)
-      mask = reader.get_mask(frame_index)
-      K = reader.get_K(frame_index)
-
-      texture_diagnostics = []
+    frame_dirty = False
+    for class_id in pending_class_ids:
       try:
+        names = object_catalog.get(class_id)
+        if names is None:
+          raise ValueError(f"{class_id} is missing from {metadata_path}")
+
+        if class_id in cad_cache:
+          cad, attempts = cad_cache[class_id]
+        else:
+          cad, attempts = resolve_cad_by_year(args.cad_root, names["year"], names)
+          cad_cache[class_id] = (cad, attempts)
+        if cad is None:
+          attempted = ", ".join(
+              f"{item['source_field']}={item['name']!r}" for item in attempts
+          ) or "no candidates"
+          raise FileNotFoundError(
+              f"No CAD asset for {class_id} (year={names['year']}); "
+              f"tried {attempted}"
+          )
+
+        if class_id not in mask_colors:
+          raise ValueError(
+              f"{class_id}: mask color not resolved for frame {frame_id}"
+          )
+
+        reader = CustomSceneReader(
+            scene_dir=scene_dir,
+            camera_name=camera_name,
+            target_class=class_id,
+            mask_color=mask_colors[class_id],
+            max_image_size=args.max_image_size,
+            validation_frame_id=frame_id,
+            mask_dir_name=mask_dir_name,
+            depth_suffix=depth_suffix,
+        )
+        frame_index = reader.id_strs.index(frame_id)
+        rgb = reader.get_color(frame_index)
+        depth = reader.get_depth(frame_index)
+        mask = reader.get_mask(frame_index)
+        K = reader.get_K(frame_index)
+
+        pose_debug_dir = scene_dir / "6d_pose_multi_debug" / frame_id / class_id
+        texture_diagnostics = []
         with load_mesh_readonly(
             mesh_file=cad["mesh_file"],
             mesh_scale=args.mesh_scale,
@@ -362,7 +336,7 @@ def main():
               mesh=mesh,
               scorer=scorer,
               refiner=refiner,
-              debug_dir=str(frame_debug_dir),
+              debug_dir=str(pose_debug_dir),
               debug=args.debug,
               glctx=glctx,
           )
@@ -374,88 +348,83 @@ def main():
               ob_mask=mask,
               iteration=args.est_refine_iter,
           )
-          np.savetxt(
-              object_debug_dir / "ob_in_cam" / f"{frame_id}.txt",
-              pose.reshape(4, 4),
-          )
 
-          original = reader.get_original_color(frame_index)
-          original_K = reader.get_original_K(frame_index)
-          if class_id not in class_display_colors:
-            color_index = len(class_display_colors) % len(display_colors)
-            class_display_colors[class_id] = display_colors[color_index]
-          line_color = class_display_colors[class_id]
-          individual_vis = draw_pose(
-              original.copy(),
-              original_K,
-              pose,
-              to_origin,
-              bbox,
-              extents,
-              class_id,
-              line_color,
+          pose_matrix = pose.reshape(4, 4)
+          frame_poses[class_id] = {
+              "object_id": class_id,
+              "object_name": scene_objects.get(class_id, {}).get("object_name"),
+              "ob_in_cam": pose_matrix.tolist(),
+          }
+          frame_dirty = True
+
+          if args.save_diagnostics:
+            original = reader.get_original_color(frame_index)
+            original_K = reader.get_original_K(frame_index)
+            if class_id not in class_display_colors:
+              color_index = len(class_display_colors) % len(display_colors)
+              class_display_colors[class_id] = display_colors[color_index]
+            line_color = class_display_colors[class_id]
+
+            individual_vis = draw_pose(
+                original.copy(), original_K, pose, to_origin, bbox, extents,
+                class_id, line_color,
+            )
+            individual_vis_path = (
+                scene_dir / "diagnostics" / "foundationpose" / "multi"
+                / "track_vis" / frame_id / f"{class_id}.png"
+            )
+            individual_vis_path.parent.mkdir(parents=True, exist_ok=True)
+            imageio.imwrite(individual_vis_path, individual_vis)
+
+            if combined_vis is None:
+              combined_vis = original.copy()
+            combined_vis = draw_pose(
+                combined_vis, original_K, pose, to_origin, bbox, extents,
+                class_id, line_color,
+            )
+
+        del estimator
+        for issue in texture_diagnostics:
+          log_issue(
+              issues_path,
+              camera_name=camera_name,
+              frame_id=frame_id,
+              class_id=class_id,
+              issue=issue.get("issue", "texture_diagnostic"),
+              message=str(issue),
           )
-          imageio.imwrite(
-              object_debug_dir / "track_vis" / f"{frame_id}.png",
-              individual_vis,
-          )
-          if combined_vis is None:
-            combined_vis = original.copy()
-          combined_vis = draw_pose(
-              combined_vis,
-              original_K,
-              pose,
-              to_origin,
-              bbox,
-              extents,
-              class_id,
-              line_color,
-          )
-      except (FileNotFoundError, NonstandardMapKdError) as error:
-        texture_issues = [
-            issue for issue in texture_diagnostics
-            if issue["issue"] in {
-                "missing_map_kd_texture",
-                "nonstandard_map_kd",
-            }
-        ]
-        if not texture_issues:
-          raise
-        append_cad_asset_issues(
-            cad_issue_log,
-            texture_issues,
-            frame_id,
-            class_id,
-            cad["name"],
+        torch.cuda.empty_cache()
+
+        processed += 1
+        logging.info("%s [%s] %s: pose saved", frame_id, camera_name, class_id)
+
+      except Exception as error:  # noqa: BLE001 - per-object isolation is required
+        failed += 1
+        log_issue(
+            issues_path,
+            camera_name=camera_name,
+            frame_id=frame_id,
+            class_id=class_id,
+            issue=type(error).__name__,
+            message=str(error),
         )
-        logging.warning(
-            "Skipping %s in frame %s: %s",
-            class_id,
-            frame_id,
-            error,
-        )
+        logging.warning("%s [%s] %s: FAILED (%s)", frame_id, camera_name, class_id, error)
         torch.cuda.empty_cache()
         continue
 
-      del estimator
-      append_cad_asset_issues(
-          cad_issue_log,
-          texture_diagnostics,
-          frame_id,
-          class_id,
-          cad["name"],
-      )
-      torch.cuda.empty_cache()
+    if frame_dirty:
+      save_frame_poses(scene_dir, frame_id, frame_poses)
+    if combined_vis is not None:
+      combined_vis_path = scene_dir / "diagnostics" / "foundationpose" / "multi" / "combined" / f"{frame_id}.png"
+      combined_vis_path.parent.mkdir(parents=True, exist_ok=True)
+      imageio.imwrite(combined_vis_path, combined_vis)
 
-    if combined_vis is None:
-      logging.warning(
-          "Frame %s has no successful object poses; combined image not saved",
-          frame_id,
-      )
-      continue
-    combined_path = combined_dir / f"{frame_id}.png"
-    imageio.imwrite(combined_path, combined_vis)
-    logging.info("Combined result saved to %s", combined_path)
+  summary_line = (
+      f"Processed {processed}, skipped {skipped}, failed {failed} "
+      f"(object-in-frame units, {len(frame_ids)} frame(s)). "
+      f"Scene: {scene_dir} [{camera_name}]"
+  )
+  logging.info(_highlight(summary_line, _ANSI_BOLD_RED if failed else _ANSI_BOLD_GREEN))
 
 
 if __name__ == "__main__":

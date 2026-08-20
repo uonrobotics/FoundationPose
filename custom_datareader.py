@@ -14,6 +14,7 @@ import shlex
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+from uuid import uuid4
 
 import cv2
 import imageio
@@ -21,6 +22,8 @@ import numpy as np
 import trimesh
 from PIL import Image
 from trimesh import resolvers
+
+from Utils import draw_posed_3d_box, draw_xyz_axis, project_3d_to_2d
 
 
 class NonstandardMapKdError(ValueError):
@@ -81,6 +84,23 @@ def resolve_2025_cad(cad_root, names):
   return None, attempts
 
 
+def resolve_cad_by_year(cad_root, year, names):
+  """Resolve a CAD asset from ``<cad_root>/peel3_scan_data_<year>/``.
+
+  Real-domain objects are scanned into a year-specific folder
+  (2024/2025/2026 under one shared ``cad_root``); this only searches the
+  folder matching the object's own catalog year, never other years.
+  """
+  year_root = Path(cad_root).expanduser() / f"peel3_scan_data_{year}"
+  if not year_root.is_dir():
+    return None, [{
+        "source_field": "cad_root",
+        "name": str(year_root),
+        "missing": [year_root],
+    }]
+  return resolve_2025_cad(year_root, names)
+
+
 def append_cad_asset_issues(log_path, issues, frame_id, class_id, cad_name):
   """Write compact, de-duplicated CAD texture issues for the current run."""
   if not issues:
@@ -124,6 +144,118 @@ def append_cad_asset_issues(log_path, issues, frame_id, class_id, cad_name):
   with log_path.open("w", encoding="utf-8") as stream:
     json.dump(records, stream, ensure_ascii=False, indent=2)
     stream.write("\n")
+
+
+def append_issue_jsonl(log_path, record):
+  """Append one JSON record as a line, creating parent dirs as needed."""
+  log_path = Path(log_path)
+  log_path.parent.mkdir(parents=True, exist_ok=True)
+  with log_path.open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def atomic_write_bytes(path, payload):
+  """Write bytes via a temp file + rename so a crash mid-write can never
+  leave a corrupted (partially written) file behind."""
+  path = Path(path)
+  path.parent.mkdir(parents=True, exist_ok=True)
+  temp_path = path.parent / f".{path.name}.{uuid4().hex}.tmp"
+  try:
+    descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o664)
+    with os.fdopen(descriptor, "wb") as stream:
+      stream.write(payload)
+      stream.flush()
+      os.fsync(stream.fileno())
+    os.replace(temp_path, path)
+  finally:
+    temp_path.unlink(missing_ok=True)
+
+
+def load_json(path):
+  with Path(path).open("r", encoding="utf-8") as stream:
+    return json.load(stream)
+
+
+def get_frame_ids(scene_dir, camera_name, requested):
+  rgb_dir = Path(scene_dir) / "rgb" / camera_name
+  files = sorted(rgb_dir.glob("*.png"))
+  if not files:
+    raise FileNotFoundError(f"No RGB PNG files found in {rgb_dir}")
+  if requested is None:
+    return [path.stem for path in files]
+  path = rgb_dir / f"{requested}.png"
+  if not path.is_file():
+    raise FileNotFoundError(f"Requested RGB frame not found: {path}")
+  return [requested]
+
+
+def detect_domain(scene_dir, frame_id):
+  """Real captures mark themselves with conf.json's "domain": "real"."""
+  conf_path = Path(scene_dir) / "conf" / f"{frame_id}.json"
+  with conf_path.open("r", encoding="utf-8") as stream:
+    conf = json.load(stream)
+  return "real" if conf.get("domain") == "real" else "virtual"
+
+
+def validate_frame_files(scene_dir, camera_name, frame_ids, domain):
+  """Fail before model loading when any selected frame input is incomplete."""
+  mask_dir_name = "inst_seg" if domain == "real" else "masks"
+  depth_suffix = ".png" if domain == "real" else ".npy"
+  required = []
+  for frame_id in frame_ids:
+    required.extend([
+        scene_dir / "depth" / camera_name / f"{frame_id}{depth_suffix}",
+        scene_dir / mask_dir_name / camera_name / f"{frame_id}.png",
+        scene_dir / "conf" / f"{frame_id}.json",
+        scene_dir / "scene_meta" / f"{frame_id}.json",
+    ])
+    if domain == "real":
+      required.append(
+          scene_dir / mask_dir_name / camera_name
+          / f"semantics_mapping_{frame_id}.json"
+      )
+  missing = [path for path in required if not path.is_file()]
+  if missing:
+    rendered = "\n  ".join(str(path) for path in missing)
+    raise FileNotFoundError(
+        "Selected RGB frames have missing corresponding input files:\n  "
+        f"{rendered}"
+    )
+
+
+def draw_pose(original, K, pose, to_origin, bbox, extents, class_id, color):
+  center_pose = pose @ np.linalg.inv(to_origin)
+  linewidth = 7
+  vis = draw_posed_3d_box(
+      K,
+      img=original,
+      ob_in_cam=center_pose,
+      bbox=bbox,
+      line_color=color,
+      linewidth=linewidth,
+  )
+  axis_scale = max(float(extents.max()) * 0.5, 0.01)
+  vis = draw_xyz_axis(
+      vis,
+      ob_in_cam=center_pose,
+      scale=axis_scale,
+      K=K,
+      thickness=linewidth,
+      transparency=0,
+      is_input_rgb=True,
+  )
+  uv = project_3d_to_2d(np.asarray([0, 0, 0, 1]), K, center_pose)
+  cv2.putText(
+      vis,
+      class_id,
+      tuple(int(value) for value in uv),
+      cv2.FONT_HERSHEY_SIMPLEX,
+      1.0,
+      color,
+      2,
+      cv2.LINE_AA,
+  )
+  return vis
 
 
 class CustomSceneReader:

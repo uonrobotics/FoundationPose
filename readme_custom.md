@@ -1,9 +1,11 @@
-# FoundationPose Custom (uonrobotics fork)
+# FoundationPose Custom
 
 이 fork는 upstream [FoundationPose](https://github.com/NVlabs/FoundationPose)에 실행기
-2개를 추가합니다: 단일 객체 실행기(첫 프레임 Pose Estimation → 이후 Tracking, 실증용)와
-멀티 객체 실행기(전체 프레임·객체 일괄 Pose Estimation, 데이터 구축용). 기본 설치는
-upstream [`readme.md`](readme.md)를 따르고, 이 문서는 추가된 실행기만 다룹니다.
+3개를 추가합니다: 추적 실행기(첫 프레임 Pose Estimation → 이후 Tracking, **실증용**),
+프레임당 물체 1개인 단일 객체 실행기와 여러 개인 멀티 객체 실행기(**데이터셋
+구축용** — 가상/실환경 자동 판별, 추적 없이 매 프레임 독립적으로 Pose Estimation).
+기본 설치는 upstream [`readme.md`](readme.md)를 따르고, 이 문서는 추가된 실행기만
+다룹니다.
 
 ## Installation
 
@@ -58,14 +60,35 @@ conda activate foundationpose
 
 ---
 
+## 세 실행기 비교
+
+| | 용도 | 처리 방식 | 프레임당 객체 수 | 가상/실환경 | 상태 |
+|---|---|---|---|---|---|
+| `run_custom_demo.py` | 실증 | 첫 프레임만 Pose Estimation, 이후는 Tracking | 1개 | 계획: 실증(실시간 연속 프레임)용으로 개편 예정 — 아직 미구현, 지금은 가상환경 전용 코드 그대로 | 검증용으로 만든 원본 코드 |
+| `run_one_object_demo.py` | 데이터셋 구축 | 매 프레임 독립적으로 Pose Estimation (Tracking 없음) | 1개 | 둘 다 지원 (자동 판별) | 사용 가능 |
+| `run_multi_object_demo.py` | 데이터셋 구축 | 매 프레임 독립적으로 Pose Estimation (Tracking 없음) | 여러 개 | 둘 다 지원 (자동 판별) | 사용 가능 |
+
+`run_custom_demo.py`는 실시간으로 연속된 프레임이 들어온다는 전제(실제 로봇 조작 중
+추적) 하에 쓸 실행기로 개편할 계획입니다. 지금 real 배치 데이터셋(`real_v1/...`)은
+frame마다 다른 물체가 섞여 있어서 이 전제가 안 맞기 때문에, 이 데이터셋에는
+`run_one_object_demo.py`/`run_multi_object_demo.py`를 씁니다.
+
+가상/실환경 판별은 CLI 인자가 아니라 각 프레임의 `conf/<frame_id>.json`에 있는
+`"domain"` 값(`"real"`이면 real, 그 외는 virtual)을 스크립트가 프레임마다 자동으로
+읽어서 정합니다.
+
+---
+
 ## Run
 
-단일 객체 실행기 : 첫 프레임에서 Pose Estimation -> 이후 프레임에서 Tracking (실증에서 활용)  
-멀티 객체 실행기 : 전체 프레임·객체에 대해 Pose Estimation (데이터 구축에서 활용) 
+아래 명령어의 경로는 호스트 기준입니다. Docker로 설치했다면 컨테이너 안에서는
+마운트 경로가 다릅니다 — 호스트 `/media/uon/data1` → 컨테이너 `/media/uon/data`.
 
-### 1. 가상환경
+### 1. 추적 실행기 — `run_custom_demo.py`
 
-단일 객체 실행기
+가상환경에서, 첫 프레임만 Pose Estimation하고 이후 프레임은 Tracking으로
+이어갑니다.
+
 ```bash
 python run_custom_demo.py \
   --cad_name paper_cup \
@@ -75,39 +98,59 @@ python run_custom_demo.py \
   --no_gui
 ```
 
-멀티 객체 실행기 (전체 프레임 실행)
+결과는 `--debug_dir`로 지정한 폴더 안에 저장됩니다.
+
+### 2. 단일 객체 실행기 — `run_one_object_demo.py`
+
+프레임마다 물체가 하나뿐인 경우에 씁니다 (real 배치 데이터셋은 항상 이 경우). 카메라 한 대만 처리합니다(`--camera_name`, 기본값 `top_view_camera`).
+
 ```bash
-python run_multi_object_demo.py \
-  --cad_root /media/uon/data1/3d_model/peel3_scan_data_2025 \
-  --camera_name top_view_camera \
-  --debug_dir debug_cough \
-  --no_gui
+python run_one_object_demo.py \
+  --dataset-root /media/uon/data1/gemini \
+  --scene real_v1/home/LivingRoom_Kitchen/dining_table
 ```
 
-멀티 객체 실행기 (특정 프레임 실행)
+결과는 scene 폴더 안에 카메라 구분 없이 저장됩니다.
+
+- `6d_pose/`, `6d_pose_json/` — 계산된 pose (같은 값을 txt/json 두 형식으로)
+- `diagnostics/foundationpose/track_vis/` — 눈으로 확인하는 이미지
+- `6d_pose_debug/` — 문제 생겼을 때 보는 상세 기록
+- `inference_meta/foundationpose/cad_asset_issues.jsonl` — 실패한 항목 목록
+
+### 3. 멀티 객체 실행기 — `run_multi_object_demo.py`
+
+프레임 하나에 물체가 여러 개 있을 수 있는 경우에 씁니다. 인자 구성은 단일 객체
+실행기와 동일합니다.
+
 ```bash
 python run_multi_object_demo.py \
-  --cad_root /media/uon/data1/3d_model/peel3_scan_data_2025 \
-  --camera_name top_view_camera \
-  --frame_id 0002 \
-  --debug_dir debug_cough \
-  --no_gui
+  --dataset-root /media/uon/data1/gemini \
+  --scene real_v1/home/LivingRoom_Kitchen/dining_table
 ```
 
-### 2. 실환경
+특정 프레임만 처리하려면 `--frame_id`를 추가합니다.
 
-멀티 객체 실행기 (전체 프레임 실행)
 ```bash
-# 호스트와 컨테이너 마운트 경로는 다름
-# 호스트 /media/uon/data1, 컨테이너 /media/uon/data
 python run_multi_object_demo.py \
-  --scene_dir /media/uon/data1/gemini/real_v1/Home/LivingRoom_Kitchen/dining_table \
-  --camera_name top_view_camera \
-  --cad_root /media/uon/data1/3d_model/peel3_scan_data_2026 \
-  --objects_metadata /media/uon/data1/gemini/objects_metadata.csv \
-  --debug_dir debug_real \
-  --no_gui
+  --dataset-root /media/uon/data1/gemini \
+  --scene real_v1/home/LivingRoom_Kitchen/dining_table \
+  --frame_id 0002
 ```
+
+결과는 scene 폴더 안에, 단일 객체 실행기 결과와 절대 안 섞이도록 전부
+`_multi`(또는 `multi/`) 표시를 붙여서 저장됩니다. 한 프레임에 물체가 여러 개면 한
+파일 안에 class_id별로 나열합니다.
+
+- `6d_pose_multi/<frame_id>.txt`, `6d_pose_multi_json/<frame_id>.json` — 그 프레임의
+  모든 객체 pose (json은 class_id를 키로 하는 딕셔너리, txt는 `# <class_id>` 줄로
+  구분된 블록)
+- `diagnostics/foundationpose/multi/combined/` — 한 프레임의 모든 객체를 한 장에 합쳐
+  그린 이미지
+- `diagnostics/foundationpose/multi/track_vis/<frame_id>/` — 객체별 개별 오버레이 이미지
+- `6d_pose_multi_debug/` — 문제 생겼을 때 보는 상세 기록 (객체별 폴더 분리)
+- `inference_meta/foundationpose/cad_asset_issues_multi.jsonl` — 실패한 항목 목록
+
+(SAM3 결과는 `diagnostics/sam3/...`, `inference_meta/sam3/...`로 따로 저장돼서 안 섞입니다.)
 
 ---
 
