@@ -37,8 +37,8 @@ docker start foundationpose && docker exec -it foundationpose bash
 conda env create -f environment.yml
 conda activate foundationpose
 
-# PyTorch 설치 (CUDA 12.4)
-python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+# PyTorch 설치 (CUDA 12.4, 버전 고정)
+python -m pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
 # CUDA 툴킷 설치. label 채널로 버전을 고정해야 하위 패키지도 고정됨
 conda install -y -c nvidia/label/cuda-12.4.0 cuda-toolkit
@@ -46,11 +46,11 @@ conda install -y -c nvidia/label/cuda-12.4.0 cuda-toolkit
 # gcc/g++ 13.4.0으로 다운그레이드 (CUDA 12.4 nvcc는 gcc 13까지만 지원)
 conda install -y -c conda-forge "gcc=13.4.0" "gxx=13.4.0"
 
-# PyTorch3D / NVDiffRast 소스 빌드
-python -m pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git"
-python -m pip install --no-build-isolation "git+https://github.com/NVlabs/nvdiffrast.git"
+# PyTorch3D / NVDiffRast 소스 빌드 (커밋 고정)
+python -m pip install --no-build-isolation "git+https://github.com/facebookresearch/pytorch3d.git@2bce7110d5621ef2a349a72ac3aacbfba8bfb461"
+python -m pip install --no-build-isolation "git+https://github.com/NVlabs/nvdiffrast.git@253ac4fcea7de5f396371124af597e6cc957bfae"
 
-# 나머지 의존성 설치 + mycpp 빌드
+# 나머지 의존성 설치(이미 버전 고정된 requirements.txt) + mycpp 빌드
 python -m pip install -r requirements.txt
 bash build_all_conda.sh
 ```
