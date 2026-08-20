@@ -158,8 +158,10 @@ logs/
 run_used.yml
 
 # Output
-debug_cough/
-debug_real/
+outputs/
+
+# CAD 파일 용량 문제 (GitHub 100MB 제한 초과)
+sample/*/mesh/
 
 # AI (Codex, Claude, etc.)
 AGENTS.md

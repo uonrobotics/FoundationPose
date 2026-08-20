@@ -1,0 +1,55 @@
+{
+    "objects": {
+        "obj_120": {
+            "level_1": "Kitchenware",
+            "level_2": "Disposable Tableware",
+            "level_3": "Cup",
+            "object_name": "disposable_paper_cup",
+            "color": "white",
+            "packaging": "",
+            "features": "cylindrical shape, elongated",
+            "description": "A white cylindrical item with an elongated form."
+        },
+        "obj_006": {
+            "level_1": "Health & Medical",
+            "level_2": "External Application",
+            "level_3": "Ointment",
+            "object_name": "fucidin_wound_ointment",
+            "color": "white, orange",
+            "packaging": "tube type",
+            "features": "\"후시딘\" text, fan-shaped logo",
+            "description": "A white and orange tube with \"후시딘\" text and a fan-shaped logo."
+        },
+        "obj_073": {
+            "level_1": "Beauty",
+            "level_2": "Hair Styling Tool",
+            "level_3": "Electric Hair Clipper",
+            "object_name": "electric_hair_clipper",
+            "color": "white, silver",
+            "packaging": "",
+            "features": "curved shape, metal and plastic material",
+            "description": "A white and silver item made of metal and plastic with a curved shape."
+        },
+        "obj_043": {
+            "level_1": "Office Supplies",
+            "level_2": "Writing Tool",
+            "level_3": "Correction Tape",
+            "object_name": "correction_tape",
+            "color": "light_blue, white",
+            "packaging": "",
+            "features": "transparent inside, plastic material, elongated shape",
+            "description": "A light blue and white item made of transparent plastic with an elongated shape."
+        },
+        "obj_195": {
+            "level_1": "General Goods",
+            "level_2": "Cleanser",
+            "level_3": "Soap",
+            "object_name": "apricot_soap_box",
+            "color": "yellow, orange",
+            "packaging": "box packaging",
+            "features": "\"향긋한 살구비누\" text, apricot image, apricot pattern background",
+            "description": "A yellow and orange box with “향긋한 살구비누” text, an apricot image, and an apricot-patterned background."
+        }
+    },
+    "Description": " A white cylindrical item with an elongated form. A white and orange tube with \"후시딘\" text and a fan-shaped logo. A white and silver item made of metal and plastic with a curved shape. A light blue and white item made of transparent plastic with an elongated shape. A yellow and orange box with “향긋한 살구비누” text, an apricot image, and an apricot-patterned background."
+}

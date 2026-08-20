@@ -9,6 +9,8 @@
 
 ## Installation
 
+[`readme.md`](readme.md)의 "Data prepare" 항목을 확인하여 모델 체크포인트(`weights/`)를 다운로드하세요.
+
 ### 1. Env setup option 1: docker
 
 ```bash
@@ -89,12 +91,16 @@ frame마다 다른 물체가 섞여 있어서 이 전제가 안 맞기 때문에
 가상환경에서, 첫 프레임만 Pose Estimation하고 이후 프레임은 Tracking으로
 이어갑니다.
 
+`sample/cough/mesh/`는 CAD 파일이 커서(100MB 넘음) git에 없습니다. 아래 명령어를
+쓰려면 `3d_model/peel3_scan_data_2025/paper_cup/`에서
+`paper_cup.obj`, `paper_cup.mtl`, `paper_cup_edited.bmp` 세 파일을 직접
+`sample/cough/mesh/`에 복사해 넣어주세요.
+
 ```bash
 python run_custom_demo.py \
-  --cad_name paper_cup \
-  --cad_root /media/uon/data1/3d_model/peel3_scan_data_2025 \
+  --mesh_file sample/cough/mesh/paper_cup.obj \
   --camera_name top_view_camera \
-  --debug_dir debug_cough \
+  --debug_dir outputs \
   --no_gui
 ```
 

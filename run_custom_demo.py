@@ -45,7 +45,7 @@ def build_parser():
   parser = argparse.ArgumentParser(
       description="Run FoundationPose without modifying the source dataset."
   )
-  parser.add_argument("--scene_dir", default=str(code_dir / "demo_data" / "cough"))
+  parser.add_argument("--scene_dir", default=str(code_dir / "sample" / "cough"))
   parser.add_argument(
       "--mesh_file",
       default=None,
@@ -122,7 +122,7 @@ def build_parser():
   parser.add_argument("--debug", type=int, default=2)
   parser.add_argument(
       "--debug_dir",
-      default=str(code_dir / "debug_cough"),
+      default=str(code_dir / "outputs"),
       help="Common output root; camera_name is appended automatically.",
   )
   parser.add_argument("--no_gui", action="store_true")
