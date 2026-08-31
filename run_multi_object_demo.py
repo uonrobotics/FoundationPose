@@ -78,6 +78,13 @@ def build_parser():
       "catalog Year.",
   )
   parser.add_argument(
+      "--objects-metadata",
+      type=Path,
+      default=None,
+      help="Override the catalog CSV path (default: "
+      "<dataset-root>/objects_metadata.csv).",
+  )
+  parser.add_argument(
       "--frame_id",
       default=None,
       help="Optional frame stem; when omitted, process every RGB frame.",
@@ -191,7 +198,11 @@ def main():
   set_seed(0)
 
   dataset_root = args.dataset_root.expanduser().resolve()
-  metadata_path = dataset_root / "objects_metadata.csv"
+  metadata_path = (
+      args.objects_metadata.expanduser().resolve()
+      if args.objects_metadata is not None
+      else dataset_root / "objects_metadata.csv"
+  )
   if not metadata_path.is_file():
     raise FileNotFoundError(f"objects_metadata.csv not found: {metadata_path}")
   scene_dir = (dataset_root / args.scene).resolve()
