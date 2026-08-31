@@ -22,7 +22,7 @@ from custom_datareader import (
     load_object_catalog,
     load_mesh_readonly,
     parse_path_mappings,
-    resolve_2025_cad,
+    resolve_cad_for_year,
     validate_mtl_textures,
 )
 from custom_mask_utils import (
@@ -210,29 +210,15 @@ def main():
     logging.info("Using explicit mesh override: %s", mesh_file)
   else:
     names = object_catalog[target_class]
-    if names["year"] == "2024":
-      selected_cad_name = names["old_name"] or names["object_name"]
-      append_cad_asset_issues(
-          cad_issue_log,
-          [{"issue": "unsupported_cad_year"}],
-          registration_frame_id,
-          target_class,
-          selected_cad_name,
-      )
-      logging.warning(
-          "Skipping %s (%s): 2024 CAD database is not supported",
-          target_class,
-          selected_cad_name,
-      )
-      return
-    cad, attempts = resolve_2025_cad(args.cad_root, names)
+    cad, attempts = resolve_cad_for_year(args.cad_root, names["year"], names)
     if cad is None:
       attempted = ", ".join(
           f"{item['source_field']}={item['name']!r}"
           for item in attempts
       ) or "no non-empty Old_name/Object_name"
       raise FileNotFoundError(
-          f"No complete 2025 CAD asset for {target_class}; tried {attempted}"
+          f"No complete CAD asset for {target_class} (year={names['year']}); "
+          f"tried {attempted}"
       )
     mesh_file = cad["mesh_file"]
     texture_roots = [str(cad["object_dir"]), *args.texture_root]
