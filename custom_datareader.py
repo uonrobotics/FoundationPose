@@ -47,8 +47,53 @@ def load_object_catalog(csv_path):
   return catalog
 
 
-def resolve_2025_cad(cad_root, names):
-  """Resolve a 2025 CAD asset by Old_name first, then Object_name."""
+# 연도별 CAD 파일 위치. obj/mtl은 모든 연도가 edited/<name>.{obj,mtl}로 고정
+# (2026-08-31 세션에 73개 전수 검증함). 새 연도가 추가되면 이 표에 등록해야 하고,
+# 등록 안 된 연도는 추측하지 않고 바로 에러를 낸다. 텍스처는 이름을 추측하지
+# 않고 mtl의 map_Kd를 직접 읽어서 정한다 — docs/cad_catalog.md 참고.
+# texture_location: 해당 연도에서 텍스처가 있어야 할 위치를 강제하는 조건.
+# "edited"면 mtl과 같은 폴더(edited/) 안이어야만 통과 — 24년도는 73개 전수
+# edited/ 안에서만 발견돼 이 조건을 추가함. 25/26년도는 아직 이 정도로 전수
+# 검증한 적이 없어 강제 조건을 걸지 않음(생략 시 edited/ 옆 또는 object root
+# 둘 다 허용).
+CAD_FILE_LAYOUT_BY_YEAR = {
+    "2024": {
+        "mesh": "edited/{name}.obj",
+        "material": "edited/{name}.mtl",
+        "texture_location": "edited",
+    },
+    "2025": {"mesh": "edited/{name}.obj", "material": "edited/{name}.mtl"},
+    "2026": {"mesh": "edited/{name}.obj", "material": "edited/{name}.mtl"},
+}
+
+
+def _texture_from_mtl(material_file, object_dir):
+  """Return the texture path the MTL's map_Kd names. Tries next to the MTL
+  first (2024's layout), then the object root (2025/2026's layout). None if
+  the MTL is missing, has no map_Kd line, or the named file exists nowhere."""
+  if not material_file.is_file():
+    return None
+  texture_name = None
+  for line in material_file.read_text(encoding="utf-8", errors="replace").splitlines():
+    stripped = line.strip()
+    if stripped.lower().startswith("map_kd"):
+      texture_name = Path(stripped.split()[-1]).name
+  if texture_name is None:
+    return None
+  next_to_mtl = material_file.parent / texture_name
+  at_object_root = object_dir / texture_name
+  return next_to_mtl if next_to_mtl.is_file() else at_object_root
+
+
+def resolve_cad_for_year(cad_root, year, names):
+  """Resolve a CAD asset by Old_name first, then Object_name, using the file
+  layout registered for this catalog year in CAD_FILE_LAYOUT_BY_YEAR."""
+  layout = CAD_FILE_LAYOUT_BY_YEAR.get(str(year))
+  if layout is None:
+    raise ValueError(
+        f"No CAD file layout registered for year {year!r}; add it to "
+        "CAD_FILE_LAYOUT_BY_YEAR."
+    )
   cad_root = Path(cad_root).expanduser()
   attempts = []
   seen = set()
@@ -60,13 +105,17 @@ def resolve_2025_cad(cad_root, names):
       continue
     seen.add(name)
     object_dir = cad_root / name
-    mesh_file = object_dir / "edited" / f"{name}.obj"
-    material_file = object_dir / "edited" / f"{name}.mtl"
-    texture_file = object_dir / f"{name}_edited.bmp"
-    missing = [
-        path for path in (mesh_file, material_file, texture_file)
-        if not path.is_file()
-    ]
+    mesh_file = object_dir / layout["mesh"].format(name=name)
+    material_file = object_dir / layout["material"].format(name=name)
+    texture_file = _texture_from_mtl(material_file, object_dir)
+    missing = [path for path in (mesh_file, material_file) if not path.is_file()]
+    if texture_file is None or not texture_file.is_file():
+      missing.append(texture_file or material_file)
+    elif (
+        layout.get("texture_location") == "edited"
+        and texture_file.parent != material_file.parent
+    ):
+      missing.append(texture_file)
     attempts.append({
         "source_field": source_field,
         "name": name,
@@ -98,7 +147,7 @@ def resolve_cad_by_year(cad_root, year, names):
         "name": str(year_root),
         "missing": [year_root],
     }]
-  return resolve_2025_cad(year_root, names)
+  return resolve_cad_for_year(year_root, year, names)
 
 
 def append_cad_asset_issues(log_path, issues, frame_id, class_id, cad_name):
@@ -550,6 +599,23 @@ def _used_material_names(mesh_file):
   return names
 
 
+def _used_texture_names(runtime_mtl, used_material_names):
+  """Collect the map_Kd filenames that used_material_names reference, by
+  reading the already-resolved runtime MTL (see _runtime_mtl)."""
+  names = set()
+  current_material = None
+  with runtime_mtl.open("r", encoding="utf-8") as stream:
+    for line in stream:
+      tokens = line.strip().split(None, 1)
+      if len(tokens) != 2:
+        continue
+      if tokens[0].lower() == "newmtl":
+        current_material = tokens[1]
+      elif tokens[0].lower() == "map_kd" and current_material in used_material_names:
+        names.add(tokens[1])
+  return names
+
+
 def _runtime_mtl(
     original_mtl,
     runtime_dir,
@@ -654,7 +720,8 @@ def load_mesh_readonly(
   with tempfile.TemporaryDirectory(prefix="foundationpose_asset_") as temp:
     runtime_dir = Path(temp)
     (runtime_dir / mesh_file.name).symlink_to(mesh_file)
-    _runtime_mtl(
+    used_material_names = _used_material_names(mesh_file)
+    runtime_mtl = _runtime_mtl(
         original_mtl,
         runtime_dir,
         path_mappings=path_mappings or [],
@@ -662,7 +729,7 @@ def load_mesh_readonly(
         expected_texture_file=expected_texture_file,
         texture_diagnostics=texture_diagnostics,
         reject_nonstandard_texture=reject_nonstandard_texture,
-        used_material_names=_used_material_names(mesh_file),
+        used_material_names=used_material_names,
     )
     # 최신 trimesh는 runtime_dir 밖을 가리키는 심링크(텍스처)를 거부하므로 허용 처리
     resolver = resolvers.FilePathResolver(str(runtime_dir), allow_anywhere=True)
@@ -670,11 +737,20 @@ def load_mesh_readonly(
         runtime_dir / mesh_file.name, process=False, resolver=resolver
     )
     if isinstance(mesh, trimesh.Scene):
-      if len(mesh.geometry) != 1:
-        raise ValueError(
-            f"Expected one mesh geometry, found {len(mesh.geometry)} in {mesh_file}"
-        )
-      mesh = next(iter(mesh.geometry.values()))
+      geometries = list(mesh.geometry.values())
+      if len(geometries) == 1:
+        mesh = geometries[0]
+      else:
+        # 부품(머티리얼)이 여러 개라도 텍스처가 하나로 같으면 합쳐서 쓴다.
+        # 부품마다 텍스처가 다른 경우(예: 제품+박스 결합 스캔)는 아직 미지원.
+        texture_names = _used_texture_names(runtime_mtl, used_material_names)
+        if len(texture_names) != 1:
+          raise ValueError(
+              f"Expected one mesh geometry or multiple parts sharing one "
+              f"texture, found {len(geometries)} parts using "
+              f"{len(texture_names)} different textures in {mesh_file}"
+          )
+        mesh = trimesh.util.concatenate(geometries)
     if not isinstance(mesh, trimesh.Trimesh):
       raise TypeError(f"Expected Trimesh, got {type(mesh).__name__} from {mesh_file}")
 
