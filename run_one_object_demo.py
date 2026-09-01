@@ -287,6 +287,7 @@ def main():
       texture_diagnostics = []
       with load_mesh_readonly(
           mesh_file=cad["mesh_file"],
+          identity_name=cad["name"],
           mesh_scale=args.mesh_scale,
           texture_roots=[cad["object_dir"]],
           max_texture_size=args.max_texture_size,

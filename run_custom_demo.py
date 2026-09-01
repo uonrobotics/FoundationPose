@@ -272,6 +272,7 @@ def main():
   try:
     validate_mtl_textures(
         mesh_file=mesh_file,
+        identity_name=selected_cad_name,
         path_mappings=path_mappings,
         texture_roots=texture_roots,
         expected_texture_file=expected_texture_file,
@@ -312,6 +313,7 @@ def main():
 
   with load_mesh_readonly(
       mesh_file=mesh_file,
+      identity_name=selected_cad_name,
       mesh_scale=args.mesh_scale,
       path_mappings=path_mappings,
       texture_roots=texture_roots,

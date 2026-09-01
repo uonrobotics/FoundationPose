@@ -47,15 +47,7 @@ def load_object_catalog(csv_path):
   return catalog
 
 
-# 연도별 CAD 파일 위치. obj/mtl은 모든 연도가 edited/<name>.{obj,mtl}로 고정
-# (2026-08-31 세션에 73개 전수 검증함). 새 연도가 추가되면 이 표에 등록해야 하고,
-# 등록 안 된 연도는 추측하지 않고 바로 에러를 낸다. 텍스처는 이름을 추측하지
-# 않고 mtl의 map_Kd를 직접 읽어서 정한다 — docs/cad_catalog.md 참고.
-# texture_location: 해당 연도에서 텍스처가 있어야 할 위치를 강제하는 조건.
-# "edited"면 mtl과 같은 폴더(edited/) 안이어야만 통과 — 24년도는 73개 전수
-# edited/ 안에서만 발견돼 이 조건을 추가함. 25/26년도는 아직 이 정도로 전수
-# 검증한 적이 없어 강제 조건을 걸지 않음(생략 시 edited/ 옆 또는 object root
-# 둘 다 허용).
+# 연도별 CAD 파일 위치
 CAD_FILE_LAYOUT_BY_YEAR = {
     "2024": {
         "mesh": "edited/{name}.obj",
@@ -63,23 +55,57 @@ CAD_FILE_LAYOUT_BY_YEAR = {
         "texture_location": "edited",
     },
     "2025": {"mesh": "edited/{name}.obj", "material": "edited/{name}.mtl"},
-    "2026": {"mesh": "edited/{name}.obj", "material": "edited/{name}.mtl"},
+    "2026": {
+        "mesh": "edited/{name}.obj",
+        "material": "edited/{name}.mtl",
+        "texture_location": "root",
+    },
 }
 
 
-def _texture_from_mtl(material_file, object_dir):
-  """Return the texture path the MTL's map_Kd names. Tries next to the MTL
-  first (2024's layout), then the object root (2025/2026's layout). None if
-  the MTL is missing, has no map_Kd line, or the named file exists nowhere."""
-  if not material_file.is_file():
+def _material_face_counts(mesh_file):
+  """Count the faces an OBJ actually assigns to each material via usemtl."""
+  counts = {}
+  current_material = None
+  with Path(mesh_file).open("r", encoding="utf-8", errors="replace") as stream:
+    for line in stream:
+      stripped = line.strip()
+      if stripped.startswith("usemtl"):
+        tokens = stripped.split(None, 1)
+        if len(tokens) == 2:
+          current_material = tokens[1].strip()
+          counts.setdefault(current_material, 0)
+      elif stripped.startswith("f ") and current_material is not None:
+        counts[current_material] += 1
+  return counts
+
+
+def _texture_from_mtl(mesh_file, material_file, object_dir):
+  """Return the texture path for the OBJ's own identity material — the one
+  whose texture filename (minus an optional _edited suffix) matches
+  object_dir's own name. Not face count: a combined-scan sibling can have
+  more faces than the object's own part. None if unresolvable."""
+  if not material_file.is_file() or not Path(mesh_file).is_file():
     return None
-  texture_name = None
-  for line in material_file.read_text(encoding="utf-8", errors="replace").splitlines():
-    stripped = line.strip()
-    if stripped.lower().startswith("map_kd"):
-      texture_name = Path(stripped.split()[-1]).name
-  if texture_name is None:
+  used_material_names = _used_material_names(mesh_file)
+  if not used_material_names:
     return None
+  textures = _used_material_textures(material_file, used_material_names)
+  distinct_textures = set(textures.values())
+  if not distinct_textures:
+    return None
+  if len(distinct_textures) == 1:
+    texture_name = next(iter(distinct_textures))
+  else:
+    identity_name = object_dir.name
+    matches = {
+        texture for texture in distinct_textures
+        if Path(texture).stem == identity_name
+        or Path(texture).stem.removesuffix("_edited") == identity_name
+    }
+    if len(matches) != 1:
+      return None
+    texture_name = next(iter(matches))
   next_to_mtl = material_file.parent / texture_name
   at_object_root = object_dir / texture_name
   return next_to_mtl if next_to_mtl.is_file() else at_object_root
@@ -107,14 +133,14 @@ def resolve_cad_for_year(cad_root, year, names):
     object_dir = cad_root / name
     mesh_file = object_dir / layout["mesh"].format(name=name)
     material_file = object_dir / layout["material"].format(name=name)
-    texture_file = _texture_from_mtl(material_file, object_dir)
+    texture_file = _texture_from_mtl(mesh_file, material_file, object_dir)
     missing = [path for path in (mesh_file, material_file) if not path.is_file()]
+    texture_location = layout.get("texture_location")
     if texture_file is None or not texture_file.is_file():
       missing.append(texture_file or material_file)
-    elif (
-        layout.get("texture_location") == "edited"
-        and texture_file.parent != material_file.parent
-    ):
+    elif texture_location == "edited" and texture_file.parent != material_file.parent:
+      missing.append(texture_file)
+    elif texture_location == "root" and texture_file.parent != object_dir:
       missing.append(texture_file)
     attempts.append({
         "source_field": source_field,
@@ -599,21 +625,64 @@ def _used_material_names(mesh_file):
   return names
 
 
-def _used_texture_names(runtime_mtl, used_material_names):
-  """Collect the map_Kd filenames that used_material_names reference, by
-  reading the already-resolved runtime MTL (see _runtime_mtl)."""
-  names = set()
+def _used_material_textures(mtl_file, used_material_names):
+  """Map each used material name to its map_Kd basename (works on the
+  original MTL or the runtime one — only the basename is compared)."""
+  textures = {}
   current_material = None
-  with runtime_mtl.open("r", encoding="utf-8") as stream:
+  with mtl_file.open("r", encoding="utf-8", errors="replace") as stream:
     for line in stream:
-      tokens = line.strip().split(None, 1)
+      stripped = line.strip()
+      tokens = stripped.split(None, 1)
       if len(tokens) != 2:
         continue
       if tokens[0].lower() == "newmtl":
         current_material = tokens[1]
       elif tokens[0].lower() == "map_kd" and current_material in used_material_names:
-        names.add(tokens[1])
-  return names
+        textures[current_material] = Path(stripped.split()[-1]).name
+  return textures
+
+
+def _used_texture_names(mtl_file, used_material_names):
+  """Collect the distinct map_Kd basenames that used_material_names
+  reference — see _used_material_textures."""
+  return set(_used_material_textures(mtl_file, used_material_names).values())
+
+
+def _identity_material_or_raise(mesh_file, original_mtl, identity_name, threshold, used_material_names):
+  """Pin the identity material by name match (see _texture_from_mtl), then
+  drop the rest if they're under `threshold` of total faces, else raise.
+  Returns (possibly narrowed used_material_names, identity material name
+  or None if untouched)."""
+  textures = _used_material_textures(original_mtl, used_material_names)
+  if len(set(textures.values())) <= 1:
+    return used_material_names, None
+
+  matches = [
+      material for material, texture in textures.items()
+      if Path(texture).stem == identity_name
+      or Path(texture).stem.removesuffix("_edited") == identity_name
+  ]
+  if len(matches) != 1:
+    raise ValueError(
+        f"Expected exactly one material whose texture matches "
+        f"{identity_name!r}, found {len(matches)} in {mesh_file} "
+        f"(textures: {sorted(set(textures.values()))})"
+    )
+  identity_material = matches[0]
+
+  face_counts = _material_face_counts(mesh_file)
+  total_faces = sum(face_counts.values())
+  minor_share = (total_faces - face_counts.get(identity_material, 0)) / total_faces
+  if minor_share >= threshold:
+    raise ValueError(
+        f"Expected one mesh geometry or multiple parts sharing one "
+        f"texture, found {len(used_material_names)} parts using "
+        f"{len(set(textures.values()))} different textures in {mesh_file} "
+        f"(non-identity parts are {minor_share:.1%} of faces, too large "
+        "to drop)"
+    )
+  return {identity_material}, identity_material
 
 
 def _runtime_mtl(
@@ -672,11 +741,13 @@ def _runtime_mtl(
 
 def validate_mtl_textures(
     mesh_file,
+    identity_name,
     path_mappings=None,
     texture_roots=None,
     expected_texture_file=None,
     texture_diagnostics=None,
     reject_nonstandard_texture=False,
+    drop_minor_part_threshold=0.05,
 ):
   """Validate MTL texture references without loading mesh geometry."""
   mesh_file = Path(mesh_file).expanduser().resolve()
@@ -685,6 +756,10 @@ def validate_mtl_textures(
   original_mtl = mesh_file.with_suffix(".mtl")
   if not original_mtl.is_file():
     raise FileNotFoundError(f"MTL not found beside mesh: {original_mtl}")
+  used_material_names, _ = _identity_material_or_raise(
+      mesh_file, original_mtl, identity_name, drop_minor_part_threshold,
+      _used_material_names(mesh_file),
+  )
   with tempfile.TemporaryDirectory(prefix="foundationpose_asset_check_") as temp:
     _runtime_mtl(
         original_mtl,
@@ -694,13 +769,14 @@ def validate_mtl_textures(
         expected_texture_file=expected_texture_file,
         texture_diagnostics=texture_diagnostics,
         reject_nonstandard_texture=reject_nonstandard_texture,
-        used_material_names=_used_material_names(mesh_file),
+        used_material_names=used_material_names,
     )
 
 
 @contextmanager
 def load_mesh_readonly(
     mesh_file,
+    identity_name,
     mesh_scale=0.001,
     path_mappings=None,
     texture_roots=None,
@@ -708,8 +784,10 @@ def load_mesh_readonly(
     expected_texture_file=None,
     texture_diagnostics=None,
     reject_nonstandard_texture=False,
+    drop_minor_part_threshold=0.05,
 ):
-  """Load a textured OBJ without editing OBJ, MTL, or texture source files."""
+  """Load a textured OBJ without editing OBJ, MTL, or texture source files.
+  See _identity_material_or_raise for multi-part handling."""
   mesh_file = Path(mesh_file).expanduser().resolve()
   if not mesh_file.is_file():
     raise FileNotFoundError(f"Mesh not found: {mesh_file}")
@@ -720,8 +798,11 @@ def load_mesh_readonly(
   with tempfile.TemporaryDirectory(prefix="foundationpose_asset_") as temp:
     runtime_dir = Path(temp)
     (runtime_dir / mesh_file.name).symlink_to(mesh_file)
-    used_material_names = _used_material_names(mesh_file)
-    runtime_mtl = _runtime_mtl(
+    used_material_names, identity_material = _identity_material_or_raise(
+        mesh_file, original_mtl, identity_name, drop_minor_part_threshold,
+        _used_material_names(mesh_file),
+    )
+    _runtime_mtl(
         original_mtl,
         runtime_dir,
         path_mappings=path_mappings or [],
@@ -737,20 +818,14 @@ def load_mesh_readonly(
         runtime_dir / mesh_file.name, process=False, resolver=resolver
     )
     if isinstance(mesh, trimesh.Scene):
-      geometries = list(mesh.geometry.values())
-      if len(geometries) == 1:
-        mesh = geometries[0]
+      if identity_material is not None:
+        # 작은 보조 부품은 버리고 본체(identity) 지오메트리만 쓴다.
+        mesh = mesh.geometry[identity_material]
+      elif len(mesh.geometry) == 1:
+        mesh = next(iter(mesh.geometry.values()))
       else:
-        # 부품(머티리얼)이 여러 개라도 텍스처가 하나로 같으면 합쳐서 쓴다.
-        # 부품마다 텍스처가 다른 경우(예: 제품+박스 결합 스캔)는 아직 미지원.
-        texture_names = _used_texture_names(runtime_mtl, used_material_names)
-        if len(texture_names) != 1:
-          raise ValueError(
-              f"Expected one mesh geometry or multiple parts sharing one "
-              f"texture, found {len(geometries)} parts using "
-              f"{len(texture_names)} different textures in {mesh_file}"
-          )
-        mesh = trimesh.util.concatenate(geometries)
+        # 부품이 여러 개지만 전부 같은 텍스처를 공유하는 경우, 합쳐서 쓴다.
+        mesh = trimesh.util.concatenate(list(mesh.geometry.values()))
     if not isinstance(mesh, trimesh.Trimesh):
       raise TypeError(f"Expected Trimesh, got {type(mesh).__name__} from {mesh_file}")
 
