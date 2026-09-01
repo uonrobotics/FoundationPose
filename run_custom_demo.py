@@ -19,6 +19,7 @@ from custom_datareader import (
     CustomSceneReader,
     NonstandardMapKdError,
     append_cad_asset_issues,
+    known_object_names_for_year,
     load_object_catalog,
     load_mesh_readonly,
     parse_path_mappings,
@@ -207,6 +208,7 @@ def main():
     texture_roots = list(args.texture_root)
     expected_texture_file = None
     selected_cad_name = mesh_file.stem
+    known_names = set()
     logging.info("Using explicit mesh override: %s", mesh_file)
   else:
     names = object_catalog[target_class]
@@ -224,6 +226,7 @@ def main():
     texture_roots = [str(cad["object_dir"]), *args.texture_root]
     expected_texture_file = cad["texture_file"]
     selected_cad_name = cad["name"]
+    known_names = known_object_names_for_year(object_catalog, names["year"])
     logging.info(
         "Selected %s via %s=%s; resolved CAD asset using %s=%s",
         target_class,
@@ -273,6 +276,7 @@ def main():
     validate_mtl_textures(
         mesh_file=mesh_file,
         identity_name=selected_cad_name,
+        known_names=known_names,
         path_mappings=path_mappings,
         texture_roots=texture_roots,
         expected_texture_file=expected_texture_file,
@@ -314,6 +318,7 @@ def main():
   with load_mesh_readonly(
       mesh_file=mesh_file,
       identity_name=selected_cad_name,
+      known_names=known_names,
       mesh_scale=args.mesh_scale,
       path_mappings=path_mappings,
       texture_roots=texture_roots,

@@ -27,6 +27,7 @@ from custom_datareader import (
     detect_domain,
     draw_pose,
     get_frame_ids,
+    known_object_names_for_year,
     load_json,
     load_mesh_readonly,
     load_object_catalog,
@@ -288,6 +289,7 @@ def main():
       with load_mesh_readonly(
           mesh_file=cad["mesh_file"],
           identity_name=cad["name"],
+          known_names=known_object_names_for_year(object_catalog, names["year"]),
           mesh_scale=args.mesh_scale,
           texture_roots=[cad["object_dir"]],
           max_texture_size=args.max_texture_size,
