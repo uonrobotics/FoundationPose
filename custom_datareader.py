@@ -23,8 +23,6 @@ import trimesh
 from PIL import Image
 from trimesh import resolvers
 
-from Utils import draw_posed_3d_box, draw_xyz_axis, project_3d_to_2d
-
 
 class NonstandardMapKdError(ValueError):
   """Raised when strict CAD loading rejects a nonstandard texture name."""
@@ -138,43 +136,6 @@ def resolve_cad_by_year(cad_root, year, names):
   return resolve_cad_for_year(year_root, year, names)
 
 
-def append_cad_asset_issues(log_path, issues, frame_id, class_id, cad_name):
-  """Write compact, de-duplicated CAD texture issues for the current run."""
-  if not issues:
-    return
-  log_path = Path(log_path)
-  if log_path.is_file():
-    with log_path.open("r", encoding="utf-8") as stream:
-      records = json.load(stream)
-  else:
-    records = []
-  for issue in issues:
-    if issue["issue"] == "nonstandard_map_kd":
-      message = (
-          "MTL texture name does not match the object's own identity name. "
-          "This object was skipped."
-      )
-    else:
-      message = (
-          "The texture referenced by map_Kd does not exist. "
-          "This object was skipped."
-      )
-    record = {
-        "frame_id": frame_id,
-        "class_id": class_id,
-        "cad_name": cad_name,
-        "issue": issue["issue"],
-        "expected_texture": issue["expected_texture"],
-        "resolved_texture": issue["resolved_texture"],
-        "message": message,
-    }
-    if record not in records:
-      records.append(record)
-  with log_path.open("w", encoding="utf-8") as stream:
-    json.dump(records, stream, ensure_ascii=False, indent=2)
-    stream.write("\n")
-
-
 def append_issue_jsonl(log_path, record):
   """Append one JSON record as a line, creating parent dirs as needed."""
   log_path = Path(log_path)
@@ -253,6 +214,11 @@ def validate_frame_files(scene_dir, camera_name, frame_ids, domain):
 
 
 def draw_pose(original, K, pose, to_origin, bbox, extents, class_id, color):
+  # 이 함수만 Utils(torch/pytorch3d/nvdiffrast 등)가 필요해서, 이 모듈을
+  # CAD 검증처럼 렌더링 없이 쓰는 호출부까지 무거운 의존성을 끌고오지 않도록
+  # 지연 import한다.
+  from Utils import draw_posed_3d_box, draw_xyz_axis, project_3d_to_2d
+
   center_pose = pose @ np.linalg.inv(to_origin)
   linewidth = 7
   vis = draw_posed_3d_box(
@@ -710,39 +676,6 @@ def _runtime_mtl(
   runtime_mtl = runtime_dir / original_mtl.name
   runtime_mtl.write_text("".join(output_lines), encoding="utf-8")
   return runtime_mtl
-
-
-def validate_mtl_textures(
-    mesh_file,
-    identity_name,
-    known_names,
-    path_mappings=None,
-    texture_roots=None,
-    expected_texture_file=None,
-    texture_diagnostics=None,
-    reject_nonstandard_texture=False,
-):
-  """Validate MTL texture references without loading mesh geometry."""
-  mesh_file = Path(mesh_file).expanduser().resolve()
-  if not mesh_file.is_file():
-    raise FileNotFoundError(f"Mesh not found: {mesh_file}")
-  original_mtl = mesh_file.with_suffix(".mtl")
-  if not original_mtl.is_file():
-    raise FileNotFoundError(f"MTL not found beside mesh: {original_mtl}")
-  used_material_names, _ = _identity_material_or_raise(
-      original_mtl, identity_name, known_names, _used_material_names(mesh_file),
-  )
-  with tempfile.TemporaryDirectory(prefix="foundationpose_asset_check_") as temp:
-    _runtime_mtl(
-        original_mtl,
-        Path(temp),
-        path_mappings=path_mappings or [],
-        texture_roots=texture_roots or [],
-        expected_texture_file=expected_texture_file,
-        texture_diagnostics=texture_diagnostics,
-        reject_nonstandard_texture=reject_nonstandard_texture,
-        used_material_names=used_material_names,
-    )
 
 
 @contextmanager

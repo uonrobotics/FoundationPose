@@ -17,14 +17,11 @@ import trimesh
 
 from custom_datareader import (
     CustomSceneReader,
-    NonstandardMapKdError,
-    append_cad_asset_issues,
     known_object_names_for_year,
     load_object_catalog,
     load_mesh_readonly,
     parse_path_mappings,
     resolve_cad_for_year,
-    validate_mtl_textures,
 )
 from custom_mask_utils import (
     get_camera,
@@ -199,9 +196,6 @@ def main():
   debug_dir = debug_root / args.camera_name
   (debug_dir / "track_vis").mkdir(parents=True, exist_ok=True)
   (debug_dir / "ob_in_cam").mkdir(parents=True, exist_ok=True)
-  cad_issue_log = debug_dir / "cad_asset_issues.json"
-  with cad_issue_log.open("w", encoding="utf-8") as stream:
-    stream.write("[]\n")
 
   if args.mesh_file:
     mesh_file = Path(args.mesh_file).expanduser()
@@ -271,38 +265,6 @@ def main():
     mask_color = mask_colors[target_class]
     logging.info("Automatically selected mask color RGB%s", mask_color)
 
-  texture_diagnostics = []
-  try:
-    validate_mtl_textures(
-        mesh_file=mesh_file,
-        identity_name=selected_cad_name,
-        known_names=known_names,
-        path_mappings=path_mappings,
-        texture_roots=texture_roots,
-        expected_texture_file=expected_texture_file,
-        texture_diagnostics=texture_diagnostics,
-        reject_nonstandard_texture=True,
-    )
-  except (FileNotFoundError, NonstandardMapKdError) as error:
-    texture_issues = [
-        issue for issue in texture_diagnostics
-        if issue["issue"] in {
-            "missing_map_kd_texture",
-            "nonstandard_map_kd",
-        }
-    ]
-    if not texture_issues:
-      raise
-    append_cad_asset_issues(
-        cad_issue_log,
-        texture_issues,
-        registration_frame_id,
-        target_class,
-        selected_cad_name,
-    )
-    logging.warning("Skipping %s: %s", target_class, error)
-    return
-
   reader = CustomSceneReader(
       scene_dir=args.scene_dir,
       camera_name=args.camera_name,
@@ -323,6 +285,8 @@ def main():
       path_mappings=path_mappings,
       texture_roots=texture_roots,
       max_texture_size=args.max_texture_size,
+      expected_texture_file=expected_texture_file,
+      reject_nonstandard_texture=True,
   ) as mesh:
     to_origin, extents = trimesh.bounds.oriented_bounds(mesh)
     bbox = np.stack([-extents / 2, extents / 2], axis=0).reshape(2, 3)
