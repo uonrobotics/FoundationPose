@@ -729,7 +729,17 @@ def load_mesh_readonly(
         mesh = next(iter(mesh.geometry.values()))
       else:
         # 부품이 여러 개지만 전부 같은 텍스처를 공유하는 경우, 합쳐서 쓴다.
-        mesh = trimesh.util.concatenate(list(mesh.geometry.values()))
+        geometries = list(mesh.geometry.values())
+        mesh = trimesh.util.concatenate(geometries)
+        # trimesh.util.concatenate는 텍스처를 공유하는 지오메트리를 합칠 때도
+        # material 병합에 가끔(비결정적으로) 실패해 ColorVisuals로 떨어뜨린다.
+        # 어차피 전부 같은 텍스처인 걸 이미 알고 있으니 UV만 이어붙이고
+        # material은 직접 지정해서 그 실패를 우회한다.
+        if getattr(mesh.visual, "material", None) is None:
+          uv = np.concatenate([g.visual.uv for g in geometries], axis=0)
+          mesh.visual = trimesh.visual.TextureVisuals(
+              uv=uv, material=geometries[0].visual.material
+          )
     if not isinstance(mesh, trimesh.Trimesh):
       raise TypeError(f"Expected Trimesh, got {type(mesh).__name__} from {mesh_file}")
 
