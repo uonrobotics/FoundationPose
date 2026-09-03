@@ -31,7 +31,9 @@ from custom_datareader import (
     load_json,
     load_mesh_readonly,
     load_object_catalog,
+    render_mesh_pose,
     resolve_cad_by_year,
+    save_pose_overlay,
     validate_frame_files,
 )
 from custom_mask_utils import (
@@ -111,8 +113,8 @@ def build_parser():
       "--save-diagnostics",
       action=argparse.BooleanOptionalAction,
       default=True,
-      help="Write a per-frame pose visualization under diagnostics/ "
-      "(default: enabled).",
+      help="Write per-frame pose visualizations (track_vis, mesh-render "
+      "overlay, stitched) under diagnostics/ (default: enabled).",
   )
   return parser
 
@@ -339,7 +341,7 @@ def main():
           original = reader.get_original_color(frame_index)
           original_K = reader.get_original_K(frame_index)
           vis = draw_pose(
-              original, original_K, pose, to_origin, bbox, extents,
+              original.copy(), original_K, pose, to_origin, bbox, extents,
               class_id, (0, 255, 0),
           )
           track_vis_path = (
@@ -348,6 +350,17 @@ def main():
           )
           track_vis_path.parent.mkdir(parents=True, exist_ok=True)
           imageio.imwrite(track_vis_path, vis)
+
+          H, W = original.shape[:2]
+          rendered_rgb, _, rendered_mask = render_mesh_pose(
+              mesh, pose_matrix, original_K, H, W, glctx,
+          )
+          diagnostics_dir = scene_dir / "diagnostics" / "foundationpose"
+          save_pose_overlay(
+              original, rendered_rgb, rendered_mask,
+              overlay_path=diagnostics_dir / "overlay" / f"{frame_id}.png",
+              stitched_path=diagnostics_dir / "stitched" / f"{frame_id}.png",
+          )
 
       del estimator
       for issue in texture_diagnostics:

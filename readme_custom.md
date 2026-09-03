@@ -119,7 +119,10 @@ python run_one_object_demo.py \
 결과는 scene 폴더 안에 카메라 구분 없이 저장됩니다.
 
 - `6d_pose/`, `6d_pose_json/` — 계산된 pose (같은 값을 txt/json 두 형식으로)
-- `diagnostics/foundationpose/track_vis/` — 눈으로 확인하는 이미지
+- `diagnostics/foundationpose/track_vis/` — 바운딩박스+좌표축을 그려 넣은 확인용 이미지
+- `diagnostics/foundationpose/overlay/` — CAD mesh를 그 pose로 실제 렌더링해서 원본 위에
+  합성한 이미지 (CAD가 실물과 실제로 맞는지 확인용)
+- `diagnostics/foundationpose/stitched/` — 원본과 overlay를 위아래로 이어붙인 비교 이미지
 - `6d_pose_debug/` — 문제 생겼을 때 보는 상세 기록
 - `inference_meta/foundationpose/cad_asset_issues.jsonl` — 실패한 항목 목록
 
@@ -152,7 +155,9 @@ python run_multi_object_demo.py \
   구분된 블록)
 - `diagnostics/foundationpose/multi/combined/` — 한 프레임의 모든 객체를 한 장에 합쳐
   그린 이미지
-- `diagnostics/foundationpose/multi/track_vis/<frame_id>/` — 객체별 개별 오버레이 이미지
+- `diagnostics/foundationpose/multi/track_vis/<frame_id>/` — 객체별 개별 바운딩박스 오버레이 이미지
+- `diagnostics/foundationpose/multi/overlay/<frame_id>/` — 객체별 CAD mesh 렌더 합성 이미지
+- `diagnostics/foundationpose/multi/stitched/<frame_id>/` — 객체별 원본+overlay 비교 이미지
 - `6d_pose_multi_debug/` — 문제 생겼을 때 보는 상세 기록 (객체별 폴더 분리)
 - `inference_meta/foundationpose/cad_asset_issues_multi.jsonl` — 실패한 항목 목록
 

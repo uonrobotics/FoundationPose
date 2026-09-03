@@ -253,6 +253,44 @@ def draw_pose(original, K, pose, to_origin, bbox, extents, class_id, color):
   return vis
 
 
+def render_mesh_pose(mesh, pose, K, H, W, glctx):
+  """mesh를 pose에서 렌더링한다. (rendered_rgb uint8, rendered_depth m, rendered_mask)."""
+  # draw_pose와 같은 이유로 지연 import한다.
+  import torch
+  from Utils import make_mesh_tensors, nvdiffrast_render
+
+  mesh_tensors = make_mesh_tensors(mesh)
+  ob_in_cams = torch.as_tensor(pose, device="cuda", dtype=torch.float)[None]
+  color, depth, _ = nvdiffrast_render(
+      K=K, H=H, W=W, ob_in_cams=ob_in_cams, glctx=glctx, mesh_tensors=mesh_tensors,
+  )
+  rendered_rgb = (color[0].detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+  rendered_depth = depth[0].detach().cpu().numpy()
+  rendered_mask = rendered_depth > 0
+  return rendered_rgb, rendered_depth, rendered_mask
+
+
+def save_pose_overlay(original_rgb, rendered_rgb, rendered_mask, overlay_path, stitched_path):
+  """렌더 합성 이미지를 overlay_path에, 원본과 이어붙인 이미지를 stitched_path에 저장한다.
+
+  블렌딩 없이, rendered_mask 안은 렌더 결과로 그대로 덮어쓴다.
+  """
+  top = Image.fromarray(original_rgb).convert("RGB")
+  composite = original_rgb.copy()
+  composite[rendered_mask] = rendered_rgb[rendered_mask]
+  bottom = Image.fromarray(composite)
+
+  overlay_path.parent.mkdir(parents=True, exist_ok=True)
+  bottom.save(overlay_path)
+
+  width = max(top.width, bottom.width)
+  stitched = Image.new("RGB", (width, top.height + bottom.height))
+  stitched.paste(top, (0, 0))
+  stitched.paste(bottom, (0, top.height))
+  stitched_path.parent.mkdir(parents=True, exist_ok=True)
+  stitched.save(stitched_path)
+
+
 class CustomSceneReader:
   """Read RGB PNG, depth (NPY or PNG), colored masks, and frame JSON metadata.
 
