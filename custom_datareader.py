@@ -180,11 +180,17 @@ def get_frame_ids(scene_dir, camera_name, requested):
 
 
 def detect_domain(scene_dir, frame_id):
-  """Real captures mark themselves with conf.json's "domain": "real"."""
+  """Tell real captures from virtual renders by conf.json's own shape.
+
+  Virtual conf.json always describes a rendered scene under "envs" (USD
+  environment, lights, physics); real captures have no such concept since
+  there is no environment to render, only a physical sensor. No explicit
+  "domain" flag is needed or maintained for this.
+  """
   conf_path = Path(scene_dir) / "conf" / f"{frame_id}.json"
   with conf_path.open("r", encoding="utf-8") as stream:
     conf = json.load(stream)
-  return "real" if conf.get("domain") == "real" else "virtual"
+  return "virtual" if "envs" in conf else "real"
 
 
 def validate_frame_files(scene_dir, camera_name, frame_ids, domain):
@@ -418,10 +424,14 @@ class CustomSceneReader:
           "nor 'intrinsic'"
       )
     K = np.asarray(intrinsic, dtype=np.float32).reshape(3, 3)
-    output_size = matches[0].get("output_size")
-    if output_size is not None and tuple(output_size) != (self.source_W, self.source_H):
+    # Real captures nest rgb/depth resolution separately under 'resolution'
+    # (they differ before depth-to-color alignment); virtual's single camera
+    # rig has no such split and still uses the flat 'output_size'.
+    resolution = matches[0].get("resolution")
+    rgb_size = resolution.get("rgb") if resolution else matches[0].get("output_size")
+    if rgb_size is not None and tuple(rgb_size) != (self.source_W, self.source_H):
       raise ValueError(
-          f"Camera output_size {tuple(output_size)} does not match RGB "
+          f"Camera rgb resolution {tuple(rgb_size)} does not match RGB "
           f"source size {(self.source_W, self.source_H)}"
       )
     return K
