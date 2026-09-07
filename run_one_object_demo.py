@@ -154,9 +154,15 @@ def log_issue(issues_path, *, camera_name, frame_id, class_id, issue, message):
   })
 
 
+def write_inference_meta(scene_dir, *, camera_name, frame_id, record):
+  path = scene_dir / "inference_meta" / "foundationpose" / camera_name / f"{frame_id}.json"
+  atomic_write_bytes(path, (json.dumps(record, indent=2) + "\n").encode("utf-8"))
+
+
 _ANSI_RESET = "\033[0m"
 _ANSI_BOLD_GREEN = "\033[1;32m"
 _ANSI_BOLD_RED = "\033[1;31m"
+_ANSI_BOLD_YELLOW = "\033[1;33m"
 
 
 def _highlight(text, ansi_code):
@@ -202,7 +208,7 @@ def main():
   glctx = dr.RasterizeCudaContext()
   cad_cache = {}
 
-  processed = skipped = failed = 0
+  processed = skipped = no_detection = failed = 0
 
   for frame_id in work_items:
     if frame_is_done(scene_dir, frame_id):
@@ -229,6 +235,37 @@ def main():
         )
       class_id, object_info = next(iter(scene_objects.items()))
       object_name = object_info.get("object_name")
+
+      if domain == "real":
+        # The authoritative "did SAM3 find this object" signal:
+        # semantics_mapping.json still lists a color for the object even
+        # when SAM3 found nothing (a separate, known issue), so checking
+        # membership there is not reliable - SAM3's own inference_meta
+        # status is written correctly either way.
+        sam3_meta_path = (
+            scene_dir / "inference_meta" / "sam3" / camera_name / f"{frame_id}.json"
+        )
+        sam3_status = load_json(sam3_meta_path).get("status")
+        if sam3_status != "ok":
+          logging.info(
+              "%s [%s] %s: SAM3 status %r; no detection, skipping",
+              frame_id, camera_name, class_id, sam3_status,
+          )
+          write_inference_meta(
+              scene_dir,
+              camera_name=camera_name,
+              frame_id=frame_id,
+              record={
+                  "frame_id": frame_id,
+                  "camera_name": camera_name,
+                  "class_id": class_id,
+                  "object_name": object_name,
+                  "status": "no_detection",
+                  "sam3_status": sam3_status,
+              },
+          )
+          no_detection += 1
+          continue
 
       names = object_catalog.get(class_id)
       if names is None:
@@ -266,6 +303,9 @@ def main():
             [class_id], scene_dir, camera_name, frame_id, mask_dir_name
         )
       if class_id not in mask_colors:
+        # SAM3 status was "ok" (checked above), so this means the mapping
+        # doesn't have the class we expect - a real data inconsistency, not
+        # a normal "nothing found" outcome.
         raise ValueError(
             f"{class_id}: mask color not resolved for frame {frame_id}"
         )
@@ -337,6 +377,25 @@ def main():
         ).encode("utf-8")
         atomic_write_bytes(pose_json_path, pose_json_payload)
 
+        if domain == "real":
+          write_inference_meta(
+              scene_dir,
+              camera_name=camera_name,
+              frame_id=frame_id,
+              record={
+                  "frame_id": frame_id,
+                  "camera_name": camera_name,
+                  "class_id": class_id,
+                  "object_name": object_name,
+                  "status": "ok",
+                  "sam3_status": sam3_status,
+                  "artifacts": {
+                      "pose_txt": str(pose_txt_path.relative_to(scene_dir)),
+                      "pose_json": str(pose_json_path.relative_to(scene_dir)),
+                  },
+              },
+          )
+
         if args.save_diagnostics:
           original = reader.get_original_color(frame_index)
           original_K = reader.get_original_K(frame_index)
@@ -391,11 +450,25 @@ def main():
       torch.cuda.empty_cache()
       continue
 
-  summary_line = (
-      f"Processed {processed}, skipped {skipped}, failed {failed} "
-      f"(of {len(work_items)} work item(s)). Scene: {scene_dir} [{camera_name}]"
+  processed_part = _highlight(f"Processed {processed}", _ANSI_BOLD_GREEN)
+  no_detection_part = _highlight(
+      f"no detection {no_detection}",
+      _ANSI_BOLD_YELLOW if no_detection else _ANSI_BOLD_GREEN,
   )
-  logging.info(_highlight(summary_line, _ANSI_BOLD_RED if failed else _ANSI_BOLD_GREEN))
+  skipped_part = _highlight(
+      f"skipped {skipped} already-done",
+      _ANSI_BOLD_YELLOW if skipped else _ANSI_BOLD_GREEN,
+  )
+  failed_part = _highlight(
+      f"failed {failed}", _ANSI_BOLD_RED if failed else _ANSI_BOLD_GREEN
+  )
+  tail = _highlight(
+      f"(of {len(work_items)} work item(s)). Scene: {scene_dir} [{camera_name}]",
+      _ANSI_BOLD_GREEN,
+  )
+  logging.info(
+      f"{processed_part}, {no_detection_part}, {skipped_part}, {failed_part} {tail}"
+  )
 
 
 if __name__ == "__main__":

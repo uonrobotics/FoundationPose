@@ -124,6 +124,10 @@ python run_one_object_demo.py \
   합성한 이미지 (CAD가 실물과 실제로 맞는지 확인용)
 - `diagnostics/foundationpose/stitched/` — 원본과 overlay를 위아래로 이어붙인 비교 이미지
 - `6d_pose_debug/` — 문제 생겼을 때 보는 상세 기록
+- `inference_meta/foundationpose/<camera>/<frame_id>.json` — 이 프레임이 pose를
+  구했는지(`ok`) 아니면 SAM3가 애초에 못 찾아서 건너뛰었는지(`no_detection`) 기록
+  (real 도메인만; SAM3 결과의 `status`가 `ok`가 아니면 CAD 조회도 안 하고 여기서
+  건너뜀)
 - `inference_meta/foundationpose/cad_asset_issues.jsonl` — 실패한 항목 목록
 
 ### 3. 멀티 객체 실행기 — `run_multi_object_demo.py`
@@ -159,9 +163,15 @@ python run_multi_object_demo.py \
 - `diagnostics/foundationpose/multi/overlay/<frame_id>/` — 객체별 CAD mesh 렌더 합성 이미지
 - `diagnostics/foundationpose/multi/stitched/<frame_id>/` — 객체별 원본+overlay 비교 이미지
 - `6d_pose_multi_debug/` — 문제 생겼을 때 보는 상세 기록 (객체별 폴더 분리)
+- `inference_meta/foundationpose/multi/<camera>/<frame_id>.json` — 그 프레임의
+  객체별로 pose를 구했는지(`ok`)/SAM3가 못 찾아서 건너뛰었는지(`no_detection`)
+  기록 (한 파일 안에 class_id를 키로 나열, 단일 객체 실행기 결과와 안 섞이도록
+  `multi/` 하위 경로에 저장)
 - `inference_meta/foundationpose/cad_asset_issues_multi.jsonl` — 실패한 항목 목록
 
-(SAM3 결과는 `diagnostics/sam3/...`, `inference_meta/sam3/...`로 따로 저장돼서 안 섞입니다.)
+(SAM3 결과는 `diagnostics/sam3/...`, `inference_meta/sam3/...`로 따로 저장돼서 안 섞입니다.
+SAM3/FoundationPose 두 단계를 씬 전체 기준으로 한 번에 훑어보려면
+[`scripts/inference_status_report.py`](../scripts/inference_status_report.py)를 씁니다.)
 
 ---
 

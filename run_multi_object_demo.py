@@ -177,9 +177,20 @@ def log_issue(issues_path, *, camera_name, frame_id, class_id, issue, message):
   })
 
 
+def record_inference_meta(scene_dir, *, camera_name, frame_id, class_id, entry):
+  path = (
+      scene_dir / "inference_meta" / "foundationpose" / "multi"
+      / camera_name / f"{frame_id}.json"
+  )
+  existing = load_json(path) if path.is_file() else {}
+  existing[class_id] = entry
+  atomic_write_bytes(path, (json.dumps(existing, indent=2) + "\n").encode("utf-8"))
+
+
 _ANSI_RESET = "\033[0m"
 _ANSI_BOLD_GREEN = "\033[1;32m"
 _ANSI_BOLD_RED = "\033[1;31m"
+_ANSI_BOLD_YELLOW = "\033[1;33m"
 
 
 def _highlight(text, ansi_code):
@@ -234,7 +245,7 @@ def main():
   ]
   class_display_colors = {}
 
-  processed = skipped = failed = 0
+  processed = skipped = no_detection = failed = 0
 
   for frame_id in frame_ids:
     try:
@@ -293,6 +304,35 @@ def main():
     frame_dirty = False
     for class_id in pending_class_ids:
       try:
+        if domain == "real":
+          # The authoritative "did SAM3 find this object" signal:
+          # semantics_mapping.json still lists a color for the object even
+          # when SAM3 found nothing (a separate, known issue), so checking
+          # membership there is not reliable - SAM3's own inference_meta
+          # status is written correctly either way.
+          sam3_meta_path = (
+              scene_dir / "inference_meta" / "sam3" / camera_name / f"{frame_id}.json"
+          )
+          sam3_status = load_json(sam3_meta_path).get("status")
+          if sam3_status != "ok":
+            logging.info(
+                "%s [%s] %s: SAM3 status %r; no detection, skipping",
+                frame_id, camera_name, class_id, sam3_status,
+            )
+            record_inference_meta(
+                scene_dir,
+                camera_name=camera_name,
+                frame_id=frame_id,
+                class_id=class_id,
+                entry={
+                    "object_name": scene_objects.get(class_id, {}).get("object_name"),
+                    "status": "no_detection",
+                    "sam3_status": sam3_status,
+                },
+            )
+            no_detection += 1
+            continue
+
         names = object_catalog.get(class_id)
         if names is None:
           raise ValueError(f"{class_id} is missing from {metadata_path}")
@@ -312,6 +352,9 @@ def main():
           )
 
         if class_id not in mask_colors:
+          # SAM3 status was "ok" (checked above), so this means the mapping
+          # doesn't have the class we expect - a real data inconsistency,
+          # not a normal "nothing found" outcome.
           raise ValueError(
               f"{class_id}: mask color not resolved for frame {frame_id}"
           )
@@ -373,6 +416,19 @@ def main():
               "ob_in_cam": pose_matrix.tolist(),
           }
           frame_dirty = True
+
+          if domain == "real":
+            record_inference_meta(
+                scene_dir,
+                camera_name=camera_name,
+                frame_id=frame_id,
+                class_id=class_id,
+                entry={
+                    "object_name": scene_objects.get(class_id, {}).get("object_name"),
+                    "status": "ok",
+                    "sam3_status": sam3_status,
+                },
+            )
 
           if args.save_diagnostics:
             original = reader.get_original_color(frame_index)
@@ -449,12 +505,26 @@ def main():
       combined_vis_path.parent.mkdir(parents=True, exist_ok=True)
       imageio.imwrite(combined_vis_path, combined_vis)
 
-  summary_line = (
-      f"Processed {processed}, skipped {skipped}, failed {failed} "
-      f"(object-in-frame units, {len(frame_ids)} frame(s)). "
-      f"Scene: {scene_dir} [{camera_name}]"
+  processed_part = _highlight(f"Processed {processed}", _ANSI_BOLD_GREEN)
+  no_detection_part = _highlight(
+      f"no detection {no_detection}",
+      _ANSI_BOLD_YELLOW if no_detection else _ANSI_BOLD_GREEN,
   )
-  logging.info(_highlight(summary_line, _ANSI_BOLD_RED if failed else _ANSI_BOLD_GREEN))
+  skipped_part = _highlight(
+      f"skipped {skipped} already-done",
+      _ANSI_BOLD_YELLOW if skipped else _ANSI_BOLD_GREEN,
+  )
+  failed_part = _highlight(
+      f"failed {failed}", _ANSI_BOLD_RED if failed else _ANSI_BOLD_GREEN
+  )
+  tail = _highlight(
+      f"(object-in-frame units, {len(frame_ids)} frame(s)). "
+      f"Scene: {scene_dir} [{camera_name}]",
+      _ANSI_BOLD_GREEN,
+  )
+  logging.info(
+      f"{processed_part}, {no_detection_part}, {skipped_part}, {failed_part} {tail}"
+  )
 
 
 if __name__ == "__main__":
